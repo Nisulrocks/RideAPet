@@ -18,6 +18,10 @@ KeySystem.Config.DiscordLink = "https://discord.gg/jUctfTAa5D"
 
 KeySystem.Validate():andThen(function()
 
+-- Everything below runs inside one guarded call, so a failure at start-up reports
+-- where it happened (script line and call stack) instead of a bare error.
+local bootOk, bootErr = xpcall(function()
+
 -----------------------------------------------------------
 -- SERVICES
 -----------------------------------------------------------
@@ -2187,7 +2191,7 @@ function Fn.firstOption(option)
 	return type(option) == "table" and option[1] or option
 end
 
-local Window = Rayfield:CreateWindow({
+local windowOk, Window = pcall(Rayfield.CreateWindow, Rayfield, {
 	Name = "Ride A Pet V1.0.2",
 	LoadingTitle = "RAP Auto Farm V1.0.2",
 	LoadingSubtitle = "by NisulRocks | Made with love",
@@ -2198,6 +2202,11 @@ local Window = Rayfield:CreateWindow({
 	ConfigurationSaving = { Enabled = true, FolderName = "NisulRocks RAP", FileName = "RAP_AutoFarm_V1" },
 	KeySystem = false,
 })
+
+if not windowOk or not Window then
+	warn("[RAP] Rayfield could not build the window (this executor may not support it): " .. tostring(Window))
+	return
+end
 
 function Fn.addToggle(tab, label, name, flag, default, onChange)
 	return Fn.safeUI(label, function()
@@ -2553,5 +2562,13 @@ if #UIErrors > 0 then
 end
 
 Fn.notify("System Ready", "Welcome to NisulRocks RAP AutoFarm V1.0.2", 5)
+
+end, function(err)
+	return debug.traceback(tostring(err), 2)
+end)
+
+if not bootOk then
+	warn("[RAP] failed to start: " .. tostring(bootErr))
+end
 
 end)
