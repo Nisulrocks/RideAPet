@@ -1,0 +1,2557 @@
+--[[
+	NisulRocks - Ride A Pet Auto Farm
+	GameId 10035204815 | PlaceId 124216119978534
+
+	V1.0.2
+]]
+
+if game.GameId ~= 10035204815 then return end -- Ride A Pet only
+
+local KeySystem = loadstring(game:HttpGet("https://raw.githubusercontent.com/Nisulrocks/Key-system/refs/heads/main/Main"))()
+
+KeySystem.Config.ScriptName = "NisulRocks RAP AutoFarm"
+KeySystem.Config.Version    = "V1.0.2"
+
+KeySystem.Config.StorageId  = "NisulRocks_RAP_AutoFarm"          -- STABLE ID
+KeySystem.Config.CorrectKey = "RideAPetRelease"  -- CHANGE THIS
+KeySystem.Config.DiscordLink = "https://discord.gg/jUctfTAa5D"
+
+KeySystem.Validate():andThen(function()
+
+-----------------------------------------------------------
+-- SERVICES
+-----------------------------------------------------------
+
+-- Everything callable lives in `Fn` and every setting in `S`: one function may
+-- only hold 200 locals, and this script is far past that if each helper is a local.
+local Fn = {}
+
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local HttpService        = game:GetService("HttpService")
+local TeleportService    = game:GetService("TeleportService")
+local CollectionService  = game:GetService("CollectionService")
+local VirtualUser        = game:GetService("VirtualUser")
+local Workspace          = game:GetService("Workspace")
+local Lighting           = game:GetService("Lighting")
+local StatsService       = game:GetService("Stats")
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+local ICON_ID = 4483362458
+
+-- Where the script reloads itself after a server change (set to the hosted copy).
+local RELOAD_URL = "https://raw.githubusercontent.com/Nisulrocks/Ride-A-Pet/refs/heads/main/main"
+
+-----------------------------------------------------------
+-- SINGLE INSTANCE
+-----------------------------------------------------------
+
+-- Autoexec plus a manual run would otherwise stack loops and windows. Every
+-- execution bumps the generation; older copies see a newer one and stop.
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+
+if env.NisulRAPRayfield then
+	pcall(function() env.NisulRAPRayfield:Destroy() end)
+	env.NisulRAPRayfield = nil
+	task.wait(0.5)
+end
+
+env.NisulRAPGen = (env.NisulRAPGen or 0) + 1
+local myGen = env.NisulRAPGen
+
+-----------------------------------------------------------
+-- STATE
+-----------------------------------------------------------
+
+local S = {
+	-- collecting
+	autoCollect     = false,
+	minEggRank      = 0,
+	targetEggs      = {},          -- set of egg names; empty = any
+	collectPriority = "Highest Rarity",
+	flySpeed        = 600,
+
+	-- planting and hatching
+	autoPlant       = false,
+	plantMinRank    = 0,
+	plantEvery      = 5,           -- minutes between planting everything we hold
+	autoHatch       = false,
+	hatchEvery      = 5,           -- minutes between hatching everything that is ready
+
+	-- pets
+	autoPlace       = false,
+	swapWeaker      = false,
+	autoFeed        = false,
+	feedFoods       = {},          -- set of food names; empty = any
+
+	-- shop
+	autoBuyFood     = false,
+	buyFoods        = {},
+	autoBuyGear     = false,
+	buyGears        = {},
+	keepCash        = 0,
+
+	-- progress
+	autoRebirth     = false,
+	autoIndex       = false,
+	autoLuck        = false,
+	luckEvery       = 5,           -- minutes between maxing the hatch luck upgrade
+
+	-- player
+	speedBoost      = false,
+	boostSpeed      = 60,
+	infJump         = false,
+	noclip          = false,
+	instantPickup   = false,
+	espEggs         = false,
+	espMinRank      = 0,
+	espMaxLabels    = 10,
+	espMaxDist      = 4000,
+
+	-- server
+	hopMode         = "Least Players",
+	autoReload      = true,
+
+	-- misc
+	antiAfk         = true,
+	noRender        = false,
+	lowGfx          = false,
+
+	-- webhook
+	webhookUrl      = "",
+	whHideName      = false,
+	whEggs          = false,
+	whEggMinRank    = 0,
+	whPets          = false,
+	whPetMinRank    = 0,
+	whTeam          = false,
+	whTeamEvery     = 0,
+
+	-- runtime
+	unloaded        = false,
+	busy            = false,
+	status          = "Idle",
+	espTarget       = nil,         -- map egg being flown to, highlighted by the ESP
+}
+
+local Stat = {
+	startTime = os.time(),
+	picked    = 0,
+	delivered = 0,
+	planted   = 0,
+	hatched   = 0,
+	placed    = 0,
+	fed       = 0,
+	bought    = 0,
+	rebirths  = 0,
+	luckRuns  = 0,
+	errors    = 0,
+}
+
+-- What the webhook has to say: eggs delivered since the last report, pets that
+-- turned up, and the moment the pet team last changed.
+local Report = { eggs = {}, pets = {}, petSeen = {}, teamDirtyAt = nil, teamSentAt = os.clock() }
+
+function Fn.alive()
+	return myGen == env.NisulRAPGen and not S.unloaded
+end
+
+-- Connections to drop when the script is unloaded.
+local Conns = {}
+
+function Fn.track(conn)
+	Conns[#Conns + 1] = conn
+	return conn
+end
+
+function Fn.logError(where, err)
+	Stat.errors = Stat.errors + 1
+	warn(string.format("[RAP] %s failed: %s", where, tostring(err)))
+end
+
+-----------------------------------------------------------
+-- GAME REMOTES AND DATA
+-----------------------------------------------------------
+
+local GameRemotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+GameRemotes = GameRemotes and GameRemotes:WaitForChild("Game", 15)
+local ServerData = ReplicatedStorage:WaitForChild("ServerData", 15)
+local ActiveEggs = ServerData and ServerData:WaitForChild("ActiveEggs", 15)
+
+if not (GameRemotes and ActiveEggs) then
+	warn("[RAP] the game's remotes did not load; try again after the game finishes loading")
+	return
+end
+
+function Fn.fire(name, ...)
+	local remote = GameRemotes:FindFirstChild(name)
+	if not (remote and remote:IsA("RemoteEvent")) then return false end
+	local args = table.pack(...)
+	return (pcall(function() remote:FireServer(table.unpack(args, 1, args.n)) end))
+end
+
+local DataCache = {}
+
+-- ReplicatedStorage.GameData.<Name>, required once.
+function Fn.data(name)
+	local cached = DataCache[name]
+	if cached ~= nil then return cached or nil end
+	local folder = ReplicatedStorage:FindFirstChild("GameData")
+	local module = folder and folder:FindFirstChild(name)
+	local ok, result = false, nil
+	if module then ok, result = pcall(require, module) end
+	DataCache[name] = (ok and type(result) == "table") and result or false
+	return DataCache[name] or nil
+end
+
+local RARITIES = { "Common", "Rare", "Epic", "Legendary", "Mythic", "Divine", "Ethereal" }
+local RARITY_RANK = {}
+for i, name in ipairs(RARITIES) do RARITY_RANK[name] = i end
+
+local RARITY_CHOICES = { "Any" }
+for _, name in ipairs(RARITIES) do RARITY_CHOICES[#RARITY_CHOICES + 1] = name end
+
+local RARITY_COLORS = {
+	Common = Color3.fromRGB(214, 218, 228), Rare = Color3.fromRGB(96, 170, 255),
+	Epic = Color3.fromRGB(190, 110, 255), Legendary = Color3.fromRGB(255, 196, 66),
+	Mythic = Color3.fromRGB(255, 82, 90), Divine = Color3.fromRGB(255, 240, 150),
+	Ethereal = Color3.fromRGB(125, 225, 255),
+}
+
+function Fn.eggData(name)
+	local eggs = Fn.data("Eggs")
+	local entry = eggs and eggs[tostring(name)]
+	return type(entry) == "table" and entry or nil
+end
+
+function Fn.eggRank(name)
+	local entry = Fn.eggData(name)
+	return entry and RARITY_RANK[tostring(entry.Rarity)] or 0
+end
+
+function Fn.eggRarity(name)
+	local entry = Fn.eggData(name)
+	return entry and tostring(entry.Rarity) or "Common"
+end
+
+function Fn.eggLuck(name)
+	local entry = Fn.eggData(name)
+	return entry and tonumber(entry.Luck) or 0
+end
+
+function Fn.petData(name)
+	local pets = Fn.data("Pets")
+	local entry = pets and pets[tostring(name)]
+	return type(entry) == "table" and entry or nil
+end
+
+-- A pet's worth: its income, scaled by weight and by its mutation.
+function Fn.petScore(name, weight, mutation)
+	local data = Fn.petData(name)
+	local mutations = Fn.data("Mutations")
+	local entry = mutations and mutation and mutations[tostring(mutation)]
+	local bonus = 1 + ((type(entry) == "table" and tonumber(entry.StatMultiplier) or 0) / 100)
+	return (data and tonumber(data.Income) or 1) * math.max(tonumber(weight) or 1, 0.1) * bonus
+end
+
+-- Item names carry a suffix like "Dog [x2]"; the plain name is what the game keys on.
+function Fn.baseName(name)
+	return (string.gsub(tostring(name), "%s*%[.*$", ""))
+end
+
+function Fn.petNameOf(inst)
+	local attr = inst:GetAttribute("PetName")
+	if type(attr) == "string" and attr ~= "" then return attr end
+	return Fn.baseName(inst.Name)
+end
+
+-----------------------------------------------------------
+-- PLAYER, PLOT AND INVENTORY
+-----------------------------------------------------------
+
+function Fn.character()
+	return LocalPlayer.Character
+end
+
+function Fn.humanoid()
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum and hum.Health > 0 then return hum end
+	return nil
+end
+
+function Fn.root()
+	local char = LocalPlayer.Character
+	local part = char and char:FindFirstChild("HumanoidRootPart")
+	if part and part:IsDescendantOf(Workspace) then return part end
+	return nil
+end
+
+local plotCache = nil
+
+-- The plot whose Data.Owner is us.
+function Fn.plot()
+	local function owned(plot)
+		local data = plot and plot:FindFirstChild("Data")
+		local owner = data and data:FindFirstChild("Owner")
+		return owner ~= nil and owner.Value == LocalPlayer
+	end
+
+	if plotCache and plotCache.Parent and owned(plotCache) then return plotCache end
+	plotCache = nil
+
+	local plots = Workspace:FindFirstChild("Plots")
+	if not plots then return nil end
+	for _, plot in ipairs(plots:GetChildren()) do
+		if owned(plot) then
+			plotCache = plot
+			return plot
+		end
+	end
+	return nil
+end
+
+function Fn.plotBase()
+	local plot = Fn.plot()
+	local base = plot and plot:FindFirstChild("Baseplate")
+	if base and base:IsA("BasePart") then return base end
+	return nil
+end
+
+-- The middle of the top of our plot.
+function Fn.plotTop()
+	local base = Fn.plotBase()
+	if not base then return nil end
+	return base.Position + Vector3.new(0, base.Size.Y / 2, 0)
+end
+
+local rng = Random.new()
+
+-- A random spot on the plot, kept `spacing` studs from every point in `avoid`.
+function Fn.plotPoint(margin, avoid, spacing)
+	local base = Fn.plotBase()
+	if not base then return nil end
+	local halfX = math.max(1, base.Size.X / 2 - margin)
+	local halfZ = math.max(1, base.Size.Z / 2 - margin)
+	local topY = base.Position.Y + base.Size.Y / 2
+
+	local fallback
+	for _ = 1, 24 do
+		local local3 = Vector3.new(rng:NextNumber(-halfX, halfX), 0, rng:NextNumber(-halfZ, halfZ))
+		local world = base.CFrame:PointToWorldSpace(local3)
+		local point = Vector3.new(world.X, topY, world.Z)
+
+		local clear = true
+		for _, other in ipairs(avoid or {}) do
+			if Vector3.new(other.X - point.X, 0, other.Z - point.Z).Magnitude < (spacing or 0) then
+				clear = false
+				break
+			end
+		end
+		if clear then return point end
+		fallback = fallback or point
+	end
+	return fallback
+end
+
+function Fn.cash()
+	local saved = LocalPlayer:FindFirstChild("SavedData")
+	local value = saved and saved:FindFirstChild("Cash")
+	return value and tonumber(value.Value) or 0
+end
+
+function Fn.saved(key)
+	local saved = LocalPlayer:FindFirstChild("SavedData")
+	local value = saved and saved:FindFirstChild(key)
+	return value and value.Value or nil
+end
+
+-- Tools in the backpack or in hand that carry a CollectionService tag.
+function Fn.tools(tag)
+	local list = {}
+	local function scan(container)
+		if not container then return end
+		for _, child in ipairs(container:GetChildren()) do
+			if child:IsA("Tool") and CollectionService:HasTag(child, tag) then list[#list + 1] = child end
+		end
+	end
+	scan(LocalPlayer:FindFirstChildOfClass("Backpack"))
+	scan(LocalPlayer.Character)
+	return list
+end
+
+function Fn.equip(tool)
+	local hum, char = Fn.humanoid(), LocalPlayer.Character
+	if not (hum and tool and char) then return false end
+	if tool.Parent == char then return true end
+	pcall(function() hum:EquipTool(tool) end)
+
+	local deadline = os.clock() + 1
+	while tool.Parent ~= char and os.clock() < deadline do RunService.Heartbeat:Wait() end
+	return tool.Parent == char
+end
+
+function Fn.unequip()
+	local hum = Fn.humanoid()
+	if hum then pcall(function() hum:UnequipTools() end) end
+end
+
+-- How many of an item we hold, counting stacks.
+function Fn.toolCount(name)
+	local total = 0
+	for _, container in ipairs({ LocalPlayer:FindFirstChildOfClass("Backpack"), LocalPlayer.Character }) do
+		if container then
+			for _, child in ipairs(container:GetChildren()) do
+				if child:IsA("Tool") and Fn.baseName(child.Name) == name then
+					local amount = child:FindFirstChild("Amount", true)
+					total = total + (amount and tonumber(amount.Value) or 1)
+				end
+			end
+		end
+	end
+	return total
+end
+
+-- The egg basket we carry between the map and the plot.
+function Fn.basketCount()
+	local basket = LocalPlayer:FindFirstChild("Basket")
+	return basket and #basket:GetChildren() or 0
+end
+
+function Fn.basketCapacity()
+	local equipped = Fn.saved("EquippedEggBasket")
+	local baskets = Fn.data("EggBaskets")
+	local entry = baskets and equipped and baskets[tostring(equipped)]
+	local capacity = type(entry) == "table" and tonumber(entry.Capacity) or 1
+	if capacity == math.huge or capacity > 50 then return 50 end
+	return math.max(1, capacity)
+end
+
+-- The soonest moment an egg in the basket breaks (server time), or nil.
+function Fn.basketDeadline()
+	local basket = LocalPlayer:FindFirstChild("Basket")
+	local soonest
+	if basket then
+		for _, egg in ipairs(basket:GetChildren()) do
+			local at = tonumber(egg:GetAttribute("BreakAt"))
+			if at and (soonest == nil or at < soonest) then soonest = at end
+		end
+	end
+	return soonest
+end
+
+-----------------------------------------------------------
+-- MOVEMENT
+-----------------------------------------------------------
+
+local CRUISE_HEIGHT = 250
+local noclipSaved = {}
+
+function Fn.setNoclip(on)
+	local char = LocalPlayer.Character
+	if not char then return end
+	for _, part in ipairs(char:GetDescendants()) do
+		if part:IsA("BasePart") then
+			if on then
+				if noclipSaved[part] == nil then noclipSaved[part] = part.CanCollide end
+				part.CanCollide = false
+			elseif noclipSaved[part] ~= nil then
+				part.CanCollide = noclipSaved[part]
+			end
+		end
+	end
+	if not on then table.clear(noclipSaved) end
+end
+
+-- Short hops go straight; long ones climb to a cruising height first so nothing
+-- is in the way, cross over, then come down.
+function Fn.route(from, to)
+	local flat = Vector3.new(to.X - from.X, 0, to.Z - from.Z).Magnitude
+	if flat < 80 and math.abs(to.Y - from.Y) < 30 then return { to } end
+	local height = math.max(from.Y, to.Y) + CRUISE_HEIGHT
+	return { Vector3.new(from.X, height, from.Z), Vector3.new(to.X, height, to.Z), to }
+end
+
+function Fn.travelTime(from, to)
+	local total, here = 0, from
+	for _, point in ipairs(Fn.route(from, to)) do
+		total = total + (point - here).Magnitude
+		here = point
+	end
+	return total / math.max(S.flySpeed, 20)
+end
+
+-- Flies to `target`, stopping within `reach` studs. `abort` ends it early.
+-- Returns true if we arrived.
+function Fn.flyTo(target, abort, reach)
+	local root = Fn.root()
+	if not root or typeof(target) ~= "Vector3" then return false end
+	reach = reach or 3
+	if (root.Position - target).Magnitude <= reach then return true end
+
+	local route = Fn.route(root.Position, target)
+	local deadline = os.clock() + Fn.travelTime(root.Position, target) + 6
+	Fn.setNoclip(true)
+
+	-- The game re-enables collisions as parts are added; keep them off in flight.
+	local keepOff = RunService.Stepped:Connect(function()
+		local char = LocalPlayer.Character
+		if not char then return end
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
+		end
+	end)
+
+	local index, arrived = 1, false
+	while os.clock() < deadline and Fn.alive() do
+		if abort and abort() then break end
+		local dt = RunService.Heartbeat:Wait()
+		root = Fn.root()
+		if not root then break end
+
+		local last = index == #route
+		local offset = route[index] - root.Position
+		local distance = offset.Magnitude
+
+		if distance <= (last and reach or 2) then
+			if last then arrived = true break end
+			index = index + 1
+		else
+			local step = math.min(distance, math.max(S.flySpeed, 20) * dt)
+			local flat = Vector3.new(offset.X, 0, offset.Z)
+			local rotation = flat.Magnitude > 0.1 and CFrame.lookAt(Vector3.zero, flat.Unit) or root.CFrame.Rotation
+			pcall(function()
+				root.CFrame = CFrame.new(root.Position + offset.Unit * step) * rotation
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.AssemblyAngularVelocity = Vector3.zero
+			end)
+		end
+	end
+
+	keepOff:Disconnect()
+	Fn.setNoclip(false)
+
+	root = Fn.root()
+	if root then
+		pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+		if (root.Position - target).Magnitude <= reach + 1 then arrived = true end
+	end
+	return arrived
+end
+
+function Fn.firePrompt(prompt)
+	if not (prompt and prompt:IsA("ProximityPrompt")) then return false end
+	if typeof(fireproximityprompt) == "function" then return (pcall(fireproximityprompt, prompt)) end
+	return (pcall(function()
+		prompt:InputHoldBegin()
+		task.wait(prompt.HoldDuration + 0.1)
+		prompt:InputHoldEnd()
+	end))
+end
+
+-----------------------------------------------------------
+-- EGG COLLECTING
+-----------------------------------------------------------
+
+local EGG_LIFETIME   = 20  -- an egg in the basket breaks this many seconds after pickup
+local EGG_MARGIN     = 5   -- keep this much spare when judging whether a trip home is possible
+local DELIVER_MARGIN = 7   -- head home when the oldest egg has this long left
+
+local SkipUntil = {} -- egg node name -> time before which it is ignored
+local PickupPos = nil
+
+-- (name, position, weight) of a map egg that is ours to take, else nil.
+function Fn.eggInfo(node)
+	local name = node:GetAttribute("Egg")
+	local pos = node:GetAttribute("Position")
+	local private = node:GetAttribute("PrivateTo")
+	if type(name) ~= "string" or typeof(pos) ~= "Vector3" then return nil end
+	if private ~= nil and private ~= LocalPlayer.UserId then return nil end
+	return name, pos, tonumber(node:GetAttribute("Weight")) or 1
+end
+
+-- Eggs of a kind already taken this round are not on offer again.
+function Fn.alreadyTaken(name)
+	local taken = LocalPlayer:GetAttribute("CollectedEggs")
+	return type(taken) == "string" and taken ~= "" and string.find(taken, tostring(name) .. ",", 1, true) ~= nil
+end
+
+-- Map eggs worth taking right now, best first by the chosen priority.
+function Fn.eggCandidates(from)
+	local list, top, now = {}, Fn.plotTop(), os.clock()
+
+	for _, node in ipairs(ActiveEggs:GetChildren()) do
+		local name, pos, weight = Fn.eggInfo(node)
+		if name and not (SkipUntil[node.Name] and SkipUntil[node.Name] > now) and not Fn.alreadyTaken(name) then
+			local rank = Fn.eggRank(name)
+			if rank >= S.minEggRank and (next(S.targetEggs) == nil or S.targetEggs[name]) then
+				-- Only eggs that can still make it home before they break.
+				if not top or Fn.travelTime(pos, top) < EGG_LIFETIME - EGG_MARGIN then
+					list[#list + 1] = {
+						node = node, name = name, pos = pos, rank = rank,
+						luck = Fn.eggLuck(name) * weight, dist = (pos - from).Magnitude,
+					}
+				end
+			end
+		end
+	end
+
+	local mode = S.collectPriority
+	table.sort(list, function(a, b)
+		if mode == "Nearest" then return a.dist < b.dist end
+		if mode == "Farthest" then return a.dist > b.dist end
+		if mode == "Highest Rarity" then
+			if a.rank ~= b.rank then return a.rank > b.rank end
+			if a.luck ~= b.luck then return a.luck > b.luck end
+			return a.dist < b.dist
+		end
+		if a.luck ~= b.luck then return a.luck > b.luck end
+		return a.dist < b.dist
+	end)
+	return list
+end
+
+-- Takes the basket home and waits for the plot to accept it.
+function Fn.deliver(abort)
+	local count = Fn.basketCount()
+	if count <= 0 then return true end
+	local top = Fn.plotTop()
+	if not top then return false end
+
+	S.status = "Bringing eggs home"
+	Fn.flyTo(top + Vector3.new(0, 4, 0), abort, 4)
+
+	local deadline = os.clock() + 3
+	while Fn.basketCount() > 0 and os.clock() < deadline do RunService.Heartbeat:Wait() end
+
+	if Fn.basketCount() == 0 then
+		Stat.delivered = Stat.delivered + count
+		PickupPos = nil
+		Fn.reportEggs()
+		return true
+	end
+	return false
+end
+
+-- Fills the basket from the map, then brings it home. Returns true if anything was taken.
+function Fn.collectStep(abort)
+	if not Fn.root() then return false end
+	local capacity, gained = Fn.basketCapacity(), false
+
+	while Fn.basketCount() < capacity and not abort() do
+		local root = Fn.root()
+		if not root then break end
+
+		-- Head home if the oldest egg in the basket cannot wait for another trip.
+		local deadline, top = Fn.basketDeadline(), Fn.plotTop()
+		if deadline and top then
+			local left = deadline - Workspace:GetServerTimeNow() - Fn.travelTime(root.Position, top)
+			if left < DELIVER_MARGIN then break end
+		end
+
+		local list = Fn.eggCandidates(root.Position)
+		if #list == 0 then
+			if not gained then S.status = "No egg matches the filters" end
+			break
+		end
+
+		local egg = list[1]
+		S.status = "Collecting " .. egg.name
+		S.espTarget = egg.node.Name
+
+		local reached = Fn.flyTo(egg.pos + Vector3.new(0, 3, 0), function()
+			return abort() or egg.node.Parent == nil
+		end, 6)
+
+		if egg.node.Parent == nil then
+			-- gone before we got there
+		elseif not reached then
+			SkipUntil[egg.node.Name] = os.clock() + 20
+		else
+			local before = Fn.basketCount()
+			if before == 0 then PickupPos = egg.pos end
+			Fn.fire("EggPickup", egg.node.Name)
+
+			local wait = os.clock() + 1.2
+			while Fn.basketCount() == before and os.clock() < wait do RunService.Heartbeat:Wait() end
+
+			if Fn.basketCount() > before then
+				gained = true
+				Stat.picked = Stat.picked + 1
+				Fn.noteEgg(egg)
+			else
+				SkipUntil[egg.node.Name] = os.clock() + 20
+			end
+		end
+	end
+
+	S.espTarget = nil
+	if Fn.basketCount() > 0 then Fn.deliver(nil) end
+	return gained
+end
+
+-----------------------------------------------------------
+-- PLANTING AND HATCHING
+-----------------------------------------------------------
+
+function Fn.plotEggs()
+	local plot = Fn.plot()
+	local folder = plot and plot:FindFirstChild("Eggs")
+	return folder and folder:GetChildren() or {}
+end
+
+function Fn.plotPets()
+	local plot = Fn.plot()
+	local folder = plot and plot:FindFirstChild("Pets")
+	return folder and folder:GetChildren() or {}
+end
+
+-- Where the plot is already occupied, so new things are not dropped on top.
+function Fn.occupied()
+	local points = {}
+	for _, list in ipairs({ Fn.plotEggs(), Fn.plotPets() }) do
+		for _, inst in ipairs(list) do
+			local ok, pos = pcall(function() return inst:GetPivot().Position end)
+			if ok then points[#points + 1] = pos end
+		end
+	end
+	return points
+end
+
+-- Gets us back to the plot (its middle, a little above) unless we are already on it.
+function Fn.goHome(abort, radius)
+	local top, root = Fn.plotTop(), Fn.root()
+	if not (top and root) then return false end
+	local flat = Vector3.new(root.Position.X - top.X, 0, root.Position.Z - top.Z).Magnitude
+	if flat <= (radius or 40) and math.abs(root.Position.Y - top.Y) < 30 then return true end
+	return Fn.flyTo(top + Vector3.new(0, 4, 0), abort, 6)
+end
+
+-- Planting and hatching run on timers: every few minutes everything we hold is
+-- planted, and everything that has grown is hatched. Each run is quick, and it
+-- happens at a visit home so it never competes with the collecting trips.
+local nextPlantAt, nextHatchAt = 0, 0
+
+function Fn.plantWanted()
+	return S.autoPlant and os.clock() >= nextPlantAt
+end
+
+-- Plants every egg in the backpack. A run cut short tries again soon; a finished
+-- one waits for the interval.
+function Fn.plantStep(abort)
+	local function schedule(done) nextPlantAt = os.clock() + (done and S.plantEvery * 60 or 10) end
+
+	local eggs = {}
+	for _, tool in ipairs(Fn.tools("Egg")) do
+		if Fn.eggRank(tool.Name) >= S.plantMinRank then eggs[#eggs + 1] = tool end
+	end
+	if #eggs == 0 then
+		schedule(true)
+		return false
+	end
+
+	-- Planting happens at the plot; be there first.
+	Fn.goHome(abort, 40)
+	if abort() then
+		schedule(false)
+		return false
+	end
+
+	table.sort(eggs, function(a, b) return Fn.eggLuck(a.Name) > Fn.eggLuck(b.Name) end)
+	S.status = "Planting eggs"
+
+	-- Spots are picked as we go, none on top of another or of what is already there.
+	local taken = Fn.occupied()
+	local planted, misses, completed = 0, 0, true
+
+	for _, tool in ipairs(eggs) do
+		if abort() then
+			completed = false
+			break
+		end
+		if tool.Parent then
+			local point = Fn.plotPoint(8, taken, 5)
+			if point then
+				taken[#taken + 1] = point
+				if Fn.equip(tool) then
+					local before = #Fn.plotEggs()
+					Fn.fire("EggPlaced", { PlantPosition = point })
+
+					-- Move on the moment the plot shows the new egg.
+					local deadline = os.clock() + 0.6
+					while os.clock() < deadline and #Fn.plotEggs() == before do RunService.Heartbeat:Wait() end
+
+					if #Fn.plotEggs() > before then
+						planted = planted + 1
+						misses = 0
+						Stat.planted = Stat.planted + 1
+					else
+						misses = misses + 1
+						if misses >= 2 then break end -- the plot is full or refusing
+					end
+				end
+			end
+		end
+	end
+
+	Fn.unequip()
+	schedule(completed)
+	return planted > 0
+end
+
+-- Where a planted egg stands: "ready", "growing" (its timer counts down) or
+-- "unknown" (the timer cannot be read from where we are; the game fills it in
+-- once we are near the egg).
+function Fn.eggState(egg)
+	local timer = egg:FindFirstChild("Timer", true)
+	if not (timer and timer:IsA("TextLabel")) then return "unknown" end
+	local text = string.lower((string.gsub(tostring(timer.Text), "^%s*(.-)%s*$", "%1")))
+	if text:find("^ready") then return "ready" end
+	if text ~= "" then return "growing" end
+	return "unknown"
+end
+
+local EggVisited = setmetatable({}, { __mode = "k" }) -- planted egg -> when we last went to look
+
+-- The plot's eggs that are ready, and those whose state we have to go and see.
+function Fn.eggsByState()
+	local ready, unknown, now = {}, {}, os.clock()
+	for _, egg in ipairs(Fn.plotEggs()) do
+		local state = Fn.eggState(egg)
+		if state == "ready" then
+			ready[#ready + 1] = egg
+		elseif state == "unknown" and (EggVisited[egg] or 0) + 10 < now then
+			unknown[#unknown + 1] = egg
+		end
+	end
+	return ready, unknown
+end
+
+function Fn.hatchWanted()
+	return S.autoHatch and os.clock() >= nextHatchAt
+end
+
+-- Goes to one ready egg and presses its prompt; does not wait for the egg to go.
+function Fn.hatchQuick(egg, abort)
+	local ok, pos = pcall(function() return egg:GetPivot().Position end)
+	if not ok then return end
+	Fn.flyTo(pos + Vector3.new(0, 3, 3), abort, 5)
+
+	local prompt = egg:FindFirstChild("Hatch", true)
+	if not (prompt and prompt:IsA("ProximityPrompt")) then return end
+
+	-- The prompt switches on once we are close.
+	local wait = os.clock() + 0.4
+	while not prompt.Enabled and os.clock() < wait and not abort() do RunService.Heartbeat:Wait() end
+	Fn.firePrompt(prompt)
+
+	local settle = os.clock() + 0.3
+	while os.clock() < settle and egg.Parent do RunService.Heartbeat:Wait() end
+end
+
+-- Hatches everything that is ready in one go. A run cut short tries again soon;
+-- a finished one waits for the interval.
+function Fn.hatchStep(abort)
+	local function schedule(done) nextHatchAt = os.clock() + (done and S.hatchEvery * 60 or 10) end
+
+	S.status = "Checking eggs"
+	Fn.goHome(abort, 40)
+
+	-- Bring the plot's eggs into view before judging them.
+	local top = Fn.plotTop()
+	if top and Workspace.StreamingEnabled then
+		pcall(function() LocalPlayer:RequestStreamAroundAsync(top, 3) end)
+	end
+
+	local ready, unknown = Fn.eggsByState()
+
+	-- Eggs whose timer is unreadable from here: go and look at each one.
+	for i, egg in ipairs(unknown) do
+		if abort() or i > 12 then break end
+		EggVisited[egg] = os.clock()
+		local ok, pos = pcall(function() return egg:GetPivot().Position end)
+		if ok then
+			Fn.flyTo(pos + Vector3.new(0, 3, 3), abort, 8)
+			task.wait(0.3)
+			if Fn.eggState(egg) == "ready" then ready[#ready + 1] = egg end
+		end
+	end
+
+	local completed, queued = true, {}
+	for _, egg in ipairs(ready) do
+		if abort() then
+			completed = false
+			break
+		end
+		if egg.Parent then
+			S.status = "Hatching eggs"
+			Fn.hatchQuick(egg, abort)
+			queued[#queued + 1] = egg
+		end
+	end
+
+	-- Let the last ones go through, then count what is gone.
+	local function remaining()
+		local n = 0
+		for _, egg in ipairs(queued) do
+			if egg.Parent then n = n + 1 end
+		end
+		return n
+	end
+	local deadline = os.clock() + 1.5
+	while os.clock() < deadline and remaining() > 0 and Fn.alive() do RunService.Heartbeat:Wait() end
+
+	local hatched = #queued - remaining()
+	Stat.hatched = Stat.hatched + hatched
+	if hatched > 0 then Fn.unequip() end
+
+	schedule(completed)
+	return hatched > 0
+end
+
+-----------------------------------------------------------
+-- PETS
+-----------------------------------------------------------
+
+function Fn.maxPets()
+	return math.max(1, tonumber(LocalPlayer:GetAttribute("MaxPets")) or tonumber(Fn.saved("MaxPets")) or 5)
+end
+
+function Fn.placedScore(inst)
+	return Fn.petScore(Fn.petNameOf(inst), inst:GetAttribute("Weight"), inst:GetAttribute("Mutation"))
+end
+
+function Fn.toolScore(tool)
+	return Fn.petScore(Fn.petNameOf(tool), tool:GetAttribute("Weight"), tool:GetAttribute("Mutation"))
+end
+
+-- The strongest pet in the backpack, and its score.
+function Fn.bestPetTool()
+	local best, bestScore = nil, -1
+	for _, tool in ipairs(Fn.tools("Pet")) do
+		local score = Fn.toolScore(tool)
+		if score > bestScore then best, bestScore = tool, score end
+	end
+	return best, bestScore
+end
+
+-- The weakest placed pet, and its score.
+function Fn.weakestPlaced()
+	local worst, worstScore = nil, math.huge
+	for _, pet in ipairs(Fn.plotPets()) do
+		local score = Fn.placedScore(pet)
+		if score < worstScore then worst, worstScore = pet, score end
+	end
+	return worst, worstScore
+end
+
+function Fn.placeWanted()
+	if not S.autoPlace then return false end
+	local tool, score = Fn.bestPetTool()
+	if not tool then return false end
+	if #Fn.plotPets() < Fn.maxPets() then return true end
+	if S.swapWeaker then
+		local _, weakest = Fn.weakestPlaced()
+		return score > weakest * 1.05
+	end
+	return false
+end
+
+function Fn.placeOne(tool, abort)
+	local key = tool:GetAttribute("PetKey")
+	if not key then return false end
+
+	local top = Fn.plotTop()
+	if top then Fn.flyTo(top + Vector3.new(0, 4, 0), abort, 20) end
+	if not Fn.equip(tool) then return false end
+
+	local point = Fn.plotPoint(10, nil, 0)
+	if not point then return false end
+	local before = #Fn.plotPets()
+	Report.petSeen[key] = true
+	Fn.fire("PlacePet", key, point + Vector3.new(0, 2, 0))
+	task.wait(0.35)
+	Fn.unequip()
+
+	local deadline = os.clock() + 1.5
+	while os.clock() < deadline and #Fn.plotPets() == before do RunService.Heartbeat:Wait() end
+	return #Fn.plotPets() > before
+end
+
+function Fn.placeStep(abort)
+	local placed = 0
+
+	for _ = 1, Fn.maxPets() do
+		if abort() or not Fn.placeWanted() then break end
+		local tool = Fn.bestPetTool()
+		if not tool then break end
+
+		if #Fn.plotPets() < Fn.maxPets() then
+			S.status = "Placing " .. Fn.petNameOf(tool)
+			if not Fn.placeOne(tool, abort) then break end
+			placed = placed + 1
+			Stat.placed = Stat.placed + 1
+			Report.teamDirtyAt = os.clock()
+		else
+			-- Full: take the weakest pet off and put the stronger one down.
+			local weakest = Fn.weakestPlaced()
+			local key = weakest and weakest:GetAttribute("PetKey")
+			if not key then break end
+
+			S.status = "Swapping in a stronger pet"
+			local top = Fn.plotTop()
+			if top then Fn.flyTo(top + Vector3.new(0, 4, 0), abort, 20) end
+			Fn.fire("PickupPet", key)
+
+			local deadline = os.clock() + 1.5
+			while os.clock() < deadline and weakest.Parent do RunService.Heartbeat:Wait() end
+			if weakest.Parent then break end
+
+			if not Fn.placeOne(tool, abort) then break end
+			placed = placed + 1
+			Stat.placed = Stat.placed + 1
+			Report.teamDirtyAt = os.clock()
+		end
+	end
+	return placed > 0
+end
+
+-- Feeding ------------------------------------------------------------------------
+
+local FedAt = {} -- pet key -> time before which it is left alone
+
+function Fn.foodCost(name)
+	local foods = Fn.data("Foods")
+	local entry = foods and foods[name]
+	return type(entry) == "table" and tonumber(entry.Cost) or 0
+end
+
+-- The cheapest food we hold that the player allows.
+function Fn.cheapestFood()
+	local best, bestCost = nil, math.huge
+	for _, tool in ipairs(Fn.tools("Food")) do
+		local amount = tool:FindFirstChild("Amount", true)
+		local left = amount and tonumber(amount.Value) or 1
+		if left > 0 and (next(S.feedFoods) == nil or S.feedFoods[tool.Name]) then
+			local cost = Fn.foodCost(tool.Name)
+			if cost < bestCost then best, bestCost = tool, cost end
+		end
+	end
+	return best
+end
+
+function Fn.feedWanted()
+	if not S.autoFeed or not Fn.cheapestFood() then return false end
+	local now = os.clock()
+	for _, pet in ipairs(Fn.plotPets()) do
+		local key = pet:GetAttribute("PetKey")
+		if key and (FedAt[key] or 0) <= now then return true end
+	end
+	return false
+end
+
+function Fn.feedStep(abort)
+	local pets = Fn.plotPets()
+	table.sort(pets, function(a, b) return Fn.placedScore(a) > Fn.placedScore(b) end)
+
+	local fed = 0
+	for _, pet in ipairs(pets) do
+		if abort() then break end
+		local food = Fn.cheapestFood()
+		if not food then break end
+
+		local key = pet:GetAttribute("PetKey")
+		if key and (FedAt[key] or 0) <= os.clock() then
+			local ok, pos = pcall(function() return pet:GetPivot().Position end)
+			if ok then
+				S.status = "Feeding " .. Fn.petNameOf(pet)
+				Fn.flyTo(pos + Vector3.new(0, 4, 4), abort, 8)
+
+				if Fn.equip(food) then
+					local age = pet:GetAttribute("Age")
+					Fn.fire("FeedPet", key, food.Name)
+
+					local deadline = os.clock() + 1.2
+					while os.clock() < deadline and pet:GetAttribute("Age") == age do RunService.Heartbeat:Wait() end
+
+					FedAt[key] = os.clock() + 2
+					fed = fed + 1
+					Stat.fed = Stat.fed + 1
+				end
+			end
+		end
+	end
+
+	Fn.unequip()
+	return fed > 0
+end
+
+-----------------------------------------------------------
+-- WORKER
+-----------------------------------------------------------
+
+-- One thread does every job that moves the character, in a fixed order, so two
+-- features can never pull it in opposite directions.
+function Fn.anyJob()
+	return S.autoCollect or S.autoPlant or S.autoHatch or S.autoPlace or S.autoFeed or Fn.basketCount() > 0
+end
+
+local CHORE_BUDGET = 45 -- longest a visit home may spend on chores before eggs go back to being the priority
+
+-- One trip through the jobs, in the order that makes them help each other:
+-- bring the basket home, do the chores while we are there (plant what we just
+-- delivered, hatch what has grown, place and feed the pets that came out),
+-- then head out for more eggs. Chores get a time budget while collecting is on,
+-- so eggs on the map do not expire behind them.
+function Fn.cycle()
+	local worked = false
+
+	local function stopAll() return not Fn.alive() or not Fn.anyJob() end
+
+	-- The character only counts as busy (and Speed Boost only stands down) while a
+	-- job is actually moving it.
+	local function job(fn, ...)
+		S.busy = true
+		local result = fn(...)
+		S.busy = false
+		return result
+	end
+
+	if Fn.basketCount() > 0 then
+		job(Fn.deliver, stopAll)
+		worked = true
+	end
+
+	local budgetEnd = os.clock() + CHORE_BUDGET
+	local function stopChore(flag)
+		return function() return stopAll() or not S[flag] or os.clock() > budgetEnd end
+	end
+	local function choresOpen() return not stopAll() and os.clock() < budgetEnd end
+
+	if choresOpen() and Fn.plantWanted() and job(Fn.plantStep, stopChore("autoPlant")) then worked = true end
+	if choresOpen() and Fn.hatchWanted() and job(Fn.hatchStep, stopChore("autoHatch")) then worked = true end
+	if choresOpen() and Fn.placeWanted() and job(Fn.placeStep, stopChore("autoPlace")) then worked = true end
+	if choresOpen() and Fn.feedWanted() and job(Fn.feedStep, stopChore("autoFeed")) then worked = true end
+
+	if S.autoCollect and not stopAll() then
+		if job(Fn.collectStep, function() return stopAll() or not S.autoCollect end) then worked = true end
+	end
+	return worked
+end
+
+task.spawn(function()
+	while Fn.alive() do
+		local worked = false
+
+		if Fn.anyJob() and Fn.root() and Fn.plot() then
+			local ok, result = pcall(Fn.cycle)
+			if ok then
+				worked = result
+			else
+				Fn.logError("worker", result)
+				Fn.unequip()
+			end
+			S.busy = false
+
+			if not worked and not S.autoCollect then S.status = "Waiting for work" end
+		elseif not Fn.anyJob() then
+			S.status = "Idle"
+		end
+
+		local nextAt = os.clock() + (worked and 0.15 or 1)
+		while Fn.alive() and os.clock() < nextAt do RunService.Heartbeat:Wait() end
+	end
+end)
+
+-----------------------------------------------------------
+-- SHOP AND PROGRESS
+-----------------------------------------------------------
+
+local Stock = { Food = nil, Gears = nil }
+local ShopRetryAt = {}
+
+-- Item names of a shop category, cheapest first.
+function Fn.shopItems(category)
+	local shop = Fn.data("Shop")
+	local group = shop and shop[category]
+	local list = {}
+	if type(group) == "table" then
+		for name, item in pairs(group) do
+			if type(item) == "table" then list[#list + 1] = { name = name, price = tonumber(item.Price) or 0 } end
+		end
+	end
+	table.sort(list, function(a, b) return a.price < b.price end)
+
+	local names = {}
+	for _, entry in ipairs(list) do names[#names + 1] = entry.name end
+	return names
+end
+
+function Fn.shopPrice(category, name)
+	local shop = Fn.data("Shop")
+	local group = shop and shop[category]
+	local item = type(group) == "table" and group[name]
+	return type(item) == "table" and tonumber(item.Price) or math.huge
+end
+
+-- The server publishes stock as {Food = {name = {Amount=..}}, Gears = {...}}.
+function Fn.readStock(payload)
+	if type(payload) ~= "table" then return end
+	for category, items in pairs(payload) do
+		if (category == "Food" or category == "Gears") and type(items) == "table" then
+			local amounts = {}
+			for name, item in pairs(items) do
+				if type(item) == "table" then amounts[name] = tonumber(item.Amount) or (item.InStock and 1 or 0) end
+			end
+			Stock[category] = amounts
+		end
+	end
+end
+
+for _, name in ipairs({ "Restock", "ShopStock" }) do
+	local remote = GameRemotes:FindFirstChild(name)
+	if remote and remote:IsA("RemoteEvent") then
+		Fn.track(remote.OnClientEvent:Connect(function(payload) Fn.readStock(payload) end))
+	end
+end
+Fn.fire("ShopStock")
+
+function Fn.buyFrom(category, wanted)
+	local opened = false
+
+	for _, name in ipairs(Fn.shopItems(category)) do
+		if wanted[name] then
+			local price = Fn.shopPrice(category, name)
+			local amounts = Stock[category]
+			local left = amounts and amounts[name]
+			local tries = 0
+
+			-- Stock unknown is worth a try, but not every few seconds.
+			local allowed = left == nil and (ShopRetryAt[category .. name] or 0) <= os.clock() or (left ~= nil and left > 0)
+
+			while allowed and tries < 20 and Fn.alive() and Fn.cash() - price >= S.keepCash do
+				if not opened then
+					Fn.fire("SetOpenShop", category)
+					task.wait(0.15)
+					opened = true
+				end
+
+				local before = Fn.toolCount(name)
+				Fn.fire("BuyWithCash", category, name)
+				tries = tries + 1
+
+				local deadline = os.clock() + 0.8
+				while os.clock() < deadline and Fn.toolCount(name) <= before do RunService.Heartbeat:Wait() end
+
+				if Fn.toolCount(name) > before then
+					Stat.bought = Stat.bought + 1
+					if amounts and amounts[name] then
+						amounts[name] = math.max(0, amounts[name] - 1)
+						allowed = amounts[name] > 0
+					end
+				else
+					if amounts then amounts[name] = 0 end
+					ShopRetryAt[category .. name] = os.clock() + 30
+					allowed = false
+				end
+			end
+		end
+	end
+end
+
+task.spawn(function()
+	while Fn.alive() do
+		if S.autoBuyFood then pcall(Fn.buyFrom, "Food", S.buyFoods) end
+		if S.autoBuyGear then pcall(Fn.buyFrom, "Gears", S.buyGears) end
+		task.wait(3)
+	end
+end)
+
+-- The cost of the next rebirth, or nil when capped or unknown.
+function Fn.rebirthCost()
+	local rebirths = Fn.data("Rebirths")
+	local count = tonumber(Fn.saved("Rebirths")) or 0
+	if not rebirths then return nil end
+	local cap = tonumber(rebirths.Cap)
+	if cap and count >= cap then return nil end
+	if type(rebirths.GetCost) == "function" then
+		local ok, cost = pcall(rebirths.GetCost, count)
+		if ok and tonumber(cost) then return tonumber(cost) end
+	end
+	return nil
+end
+
+-- Plot.Upgrades with "Max" buys as many hatch luck levels as the cash allows.
+function Fn.maxHatchLuck()
+	local folder = GameRemotes:FindFirstChild("Plot")
+	local remote = folder and folder:FindFirstChild("Upgrades")
+	if not (remote and remote:IsA("RemoteEvent")) then return false end
+	local ok = pcall(function() remote:FireServer("Max") end)
+	if ok then Stat.luckRuns = Stat.luckRuns + 1 end
+	return ok
+end
+
+local nextLuckAt = 0
+
+task.spawn(function()
+	local rebirthAt, indexAt = 0, 0
+	while Fn.alive() do
+		local now = os.clock()
+
+		if S.autoRebirth and now >= rebirthAt then
+			local cost = Fn.rebirthCost()
+			if cost and Fn.cash() >= cost then
+				Fn.fire("Rebirth")
+				Stat.rebirths = Stat.rebirths + 1
+				rebirthAt = now + 15
+			else
+				rebirthAt = now + 3
+			end
+		end
+
+		if S.autoIndex and now >= indexAt then
+			Fn.fire("ClaimIndexReward")
+			indexAt = now + 60
+		end
+
+		if S.autoLuck and now >= nextLuckAt then
+			Fn.maxHatchLuck()
+			nextLuckAt = now + S.luckEvery * 60
+		end
+		task.wait(1)
+	end
+end)
+
+-----------------------------------------------------------
+-- PLAYER
+-----------------------------------------------------------
+
+Fn.track(RunService.Heartbeat:Connect(function()
+	if not S.speedBoost or S.busy then return end
+	local hum, root = Fn.humanoid(), Fn.root()
+	if not hum or not root or hum.Sit then return end
+
+	local dir = Vector3.new(hum.MoveDirection.X, 0, hum.MoveDirection.Z)
+	if dir.Magnitude < 0.05 then return end
+	root.AssemblyLinearVelocity = Vector3.new(0, root.AssemblyLinearVelocity.Y, 0) + dir.Unit * S.boostSpeed
+end))
+
+Fn.track(UserInputService.JumpRequest:Connect(function()
+	if not S.infJump then return end
+	local hum = Fn.humanoid()
+	if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end) end
+end))
+
+local noclipWasOn = false
+Fn.track(RunService.Stepped:Connect(function()
+	if S.noclip then
+		noclipWasOn = true
+		Fn.setNoclip(true)
+	elseif noclipWasOn then
+		noclipWasOn = false
+		if not S.busy then Fn.setNoclip(false) end
+	end
+end))
+
+-- Instant pickup: every prompt in the world needs no hold.
+local PromptHold, PromptConns = {}, {}
+
+function Fn.zeroPrompt(inst)
+	if not inst:IsA("ProximityPrompt") then return end
+	if PromptHold[inst] == nil then PromptHold[inst] = inst.HoldDuration end
+	if inst.HoldDuration ~= 0 then inst.HoldDuration = 0 end
+end
+
+function Fn.restorePrompts()
+	for _, conn in ipairs(PromptConns) do conn:Disconnect() end
+	table.clear(PromptConns)
+	for prompt, hold in pairs(PromptHold) do
+		if prompt.Parent then pcall(function() prompt.HoldDuration = hold end) end
+	end
+	table.clear(PromptHold)
+end
+
+function Fn.setInstantPickup(on)
+	Fn.restorePrompts()
+	if not on then return end
+	for _, inst in ipairs(Workspace:GetDescendants()) do Fn.zeroPrompt(inst) end
+	PromptConns[#PromptConns + 1] = Workspace.DescendantAdded:Connect(function(inst)
+		if inst:IsA("ProximityPrompt") then task.defer(Fn.zeroPrompt, inst) end
+	end)
+	PromptConns[#PromptConns + 1] = game:GetService("ProximityPromptService").PromptShown:Connect(Fn.zeroPrompt)
+end
+
+-- ESP ----------------------------------------------------------------------------
+-- Every map egg gets a dot on the spot. The few that matter most also get a small
+-- card above it: the name, then rarity, weight and distance. Cards never overlap:
+-- the best eggs claim screen space first, and an egg that would land on top of a
+-- card keeps just its dot. The egg being collected is outlined thicker.
+local Esp = { gui = nil, tags = {}, conns = {} }
+
+local ESP_W, ESP_H = 132, 34
+
+function Fn.espRemove(node)
+	local tag = Esp.tags[node]
+	if tag then
+		Esp.tags[node] = nil
+		pcall(function()
+			tag.card:Destroy()
+			tag.dot:Destroy()
+		end)
+	end
+end
+
+function Fn.espText(parent, y, height, size, font)
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Position = UDim2.fromOffset(14, y)
+	label.Size = UDim2.fromOffset(ESP_W - 20, height)
+	label.Font = font
+	label.TextSize = size
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextTruncate = Enum.TextTruncate.AtEnd
+	label.Parent = parent
+	return label
+end
+
+function Fn.espRound(inst, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = radius
+	corner.Parent = inst
+end
+
+function Fn.espAdd(node)
+	if Esp.tags[node] or not Esp.gui then return end
+	local name, pos, weight = Fn.eggInfo(node)
+	if not name or Fn.eggRank(name) < S.espMinRank then return end
+
+	local rarity = Fn.eggRarity(name)
+	local color = RARITY_COLORS[rarity] or Color3.fromRGB(255, 255, 255)
+	local hex = "FFFFFF"
+	pcall(function() hex = color:ToHex() end)
+
+	local card = Instance.new("Frame")
+	card.AnchorPoint = Vector2.new(0.5, 1)
+	card.Size = UDim2.fromOffset(ESP_W, ESP_H)
+	card.BackgroundColor3 = Color3.fromRGB(16, 17, 21)
+	card.BackgroundTransparency = 0.15
+	card.BorderSizePixel = 0
+	card.Visible = false
+	card.Parent = Esp.gui
+	Fn.espRound(card, UDim.new(0, 6))
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = color
+	stroke.Thickness = 1
+	stroke.Transparency = 0.4
+	stroke.Parent = card
+
+	local bar = Instance.new("Frame")
+	bar.Position = UDim2.fromOffset(6, 6)
+	bar.Size = UDim2.new(0, 3, 1, -12)
+	bar.BackgroundColor3 = color
+	bar.BorderSizePixel = 0
+	bar.Parent = card
+	Fn.espRound(bar, UDim.new(0, 2))
+
+	local title = Fn.espText(card, 3, 16, 14, Enum.Font.GothamBold)
+	title.Text = name
+	title.TextColor3 = Color3.fromRGB(245, 246, 250)
+
+	local info = Fn.espText(card, 19, 12, 11, Enum.Font.Gotham)
+	info.RichText = true
+	info.TextColor3 = Color3.fromRGB(170, 176, 192)
+
+	local dot = Instance.new("Frame")
+	dot.AnchorPoint = Vector2.new(0.5, 0.5)
+	dot.Size = UDim2.fromOffset(9, 9)
+	dot.BackgroundColor3 = color
+	dot.BorderSizePixel = 0
+	dot.Visible = false
+	dot.Parent = Esp.gui
+	Fn.espRound(dot, UDim.new(1, 0))
+	local dotStroke = Instance.new("UIStroke")
+	dotStroke.Color = Color3.fromRGB(0, 0, 0)
+	dotStroke.Thickness = 1.5
+	dotStroke.Transparency = 0.25
+	dotStroke.Parent = dot
+
+	Esp.tags[node] = {
+		card = card, dot = dot, info = info, stroke = stroke,
+		pos = pos, weight = weight, rarity = rarity, hex = hex,
+		rank = Fn.eggRank(name), luck = Fn.eggLuck(name) * weight,
+	}
+end
+
+function Fn.distText(d)
+	if d >= 1000 then return string.format("%.1fkm", d / 1000) end
+	return string.format("%dm", math.floor(d))
+end
+
+-- Places the cards, best egg first; whatever would overlap one is left as a dot.
+function Fn.espRender()
+	local camera = Workspace.CurrentCamera
+	if not camera then return end
+	local root = Fn.root()
+	local origin = root and root.Position or camera.CFrame.Position
+
+	local items = {}
+	for node, tag in pairs(Esp.tags) do
+		local screen, onScreen = camera:WorldToViewportPoint(tag.pos + Vector3.new(0, 3, 0))
+		local dist = (tag.pos - origin).Magnitude
+		if onScreen and screen.Z > 0 and dist <= S.espMaxDist then
+			items[#items + 1] = { tag = tag, node = node, x = screen.X, y = screen.Y, dist = dist }
+		else
+			tag.card.Visible = false
+			tag.dot.Visible = false
+		end
+	end
+
+	local target = S.espTarget
+	table.sort(items, function(a, b)
+		local aT, bT = a.node.Name == target, b.node.Name == target
+		if aT ~= bT then return aT end
+		if a.tag.rank ~= b.tag.rank then return a.tag.rank > b.tag.rank end
+		if a.tag.luck ~= b.tag.luck then return a.tag.luck > b.tag.luck end
+		return a.dist < b.dist
+	end)
+
+	local placed, shown = {}, 0
+	for _, item in ipairs(items) do
+		local tag, x, y = item.tag, item.x, item.y
+		local left, top, right, bottom = x - ESP_W / 2, y - ESP_H - 12, x + ESP_W / 2, y - 12
+
+		local fits = shown < S.espMaxLabels
+		if fits then
+			for _, r in ipairs(placed) do
+				if left < r[3] + 4 and right > r[1] - 4 and top < r[4] + 3 and bottom > r[2] - 3 then
+					fits = false
+					break
+				end
+			end
+		end
+
+		if fits then
+			shown = shown + 1
+			placed[#placed + 1] = { left, top, right, bottom }
+			tag.card.Position = UDim2.fromOffset(x, y - 12)
+			tag.info.Text = string.format('<font color="#%s">%s</font>   %.2fkg   %s', tag.hex, tag.rarity, tag.weight, Fn.distText(item.dist))
+			tag.stroke.Thickness = item.node.Name == target and 2.5 or 1
+			tag.stroke.Transparency = item.node.Name == target and 0 or 0.4
+			tag.card.Visible = true
+		else
+			tag.card.Visible = false
+		end
+
+		tag.dot.Position = UDim2.fromOffset(x, y)
+		tag.dot.Visible = true
+	end
+end
+
+function Fn.espStop()
+	for _, conn in ipairs(Esp.conns) do conn:Disconnect() end
+	table.clear(Esp.conns)
+	for node in pairs(Esp.tags) do Fn.espRemove(node) end
+	if Esp.gui then
+		pcall(function() Esp.gui:Destroy() end)
+		Esp.gui = nil
+	end
+end
+
+function Fn.espStart()
+	Fn.espStop()
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "RAPEsp"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 40
+	gui.Parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+	Esp.gui = gui
+
+	for _, node in ipairs(ActiveEggs:GetChildren()) do Fn.espAdd(node) end
+	Esp.conns[#Esp.conns + 1] = ActiveEggs.ChildAdded:Connect(function(node) task.defer(Fn.espAdd, node) end)
+	Esp.conns[#Esp.conns + 1] = ActiveEggs.ChildRemoved:Connect(Fn.espRemove)
+
+	local elapsed = 0
+	Esp.conns[#Esp.conns + 1] = RunService.RenderStepped:Connect(function(dt)
+		elapsed = elapsed + dt
+		if elapsed < 1 / 30 then return end
+		elapsed = 0
+		pcall(Fn.espRender)
+	end)
+end
+
+-----------------------------------------------------------
+-- SERVER
+-----------------------------------------------------------
+
+-- Reload this script after the next teleport.
+function Fn.queueReload()
+	if not S.autoReload then return end
+	local queue = queue_on_teleport or queueonteleport
+		or (type(syn) == "table" and syn.queue_on_teleport) or (type(fluxus) == "table" and fluxus.queue_on_teleport)
+	if type(queue) ~= "function" then return end
+	pcall(queue, string.format("loadstring(game:HttpGet(%q))()", RELOAD_URL))
+end
+
+local HopFailed, hopTarget, hopDenied = {}, nil, false
+
+pcall(function()
+	TeleportService.TeleportInitFailed:Connect(function()
+		if hopTarget then
+			HopFailed[hopTarget] = true
+			hopDenied = true
+		end
+	end)
+end)
+
+-- Public servers with room, as { Id, Playing, Room }.
+function Fn.fetchServers(mode)
+	local order = mode == "Least Players" and "Asc" or "Desc"
+	local pages = mode == "Random" and 3 or 6
+	local list, cursor = {}, nil
+
+	for _ = 1, pages do
+		local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&excludeFullGames=true&limit=100",
+			game.PlaceId, order)
+		if cursor then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
+
+		local ok, result = pcall(function() return HttpService:JSONDecode(game:HttpGet(url)) end)
+		if not ok or type(result) ~= "table" then return list, false end
+
+		for _, server in ipairs(result.data or {}) do
+			local id, playing, max = tostring(server.id or ""), tonumber(server.playing) or math.huge, tonumber(server.maxPlayers) or 0
+			if id ~= "" and id ~= game.JobId and playing < max then
+				list[#list + 1] = { Id = id, Playing = playing, Room = max - playing }
+			end
+		end
+
+		if #list > 0 and mode ~= "Random" then break end
+		cursor = result.nextPageCursor
+		if not cursor or cursor == "" then break end
+	end
+	return list, true
+end
+
+-- One hop attempt. Returns "ok" (teleport accepted), "denied", "empty" or "fetch".
+function Fn.hopOnce(mode)
+	local servers, fetched = Fn.fetchServers(mode)
+	if not fetched then return "fetch" end
+
+	local usable = {}
+	for _, server in ipairs(servers) do
+		if not HopFailed[server.Id] then usable[#usable + 1] = server end
+	end
+	if #usable == 0 then
+		table.clear(HopFailed)
+		return "empty"
+	end
+
+	local pick
+	if mode == "Random" then
+		pick = usable[math.random(1, #usable)]
+	else
+		table.sort(usable, function(a, b)
+			if mode == "Least Players" then return a.Playing < b.Playing end
+			return a.Playing > b.Playing
+		end)
+		pick = usable[1]
+	end
+
+	hopTarget, hopDenied = pick.Id, false
+	Fn.queueReload()
+	if not pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, pick.Id, LocalPlayer) end) then
+		HopFailed[pick.Id] = true
+		return "denied"
+	end
+
+	local deadline = os.clock() + 10
+	while os.clock() < deadline do
+		if hopDenied then return "denied" end
+		task.wait(0.25)
+	end
+	return "ok"
+end
+
+local hopRun = 0
+
+function Fn.serverHop()
+	hopRun = hopRun + 1
+	local mine = hopRun
+	local tries = 0
+
+	while mine == hopRun and Fn.alive() and tries < 40 do
+		tries = tries + 1
+		local result = Fn.hopOnce(S.hopMode)
+		if result == "ok" then return end
+		task.wait(result == "fetch" and 1 or 0.2)
+	end
+end
+
+function Fn.rejoin()
+	Fn.queueReload()
+	pcall(function()
+		if game.JobId ~= "" then
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+		else
+			TeleportService:Teleport(game.PlaceId, LocalPlayer)
+		end
+	end)
+end
+
+function Fn.joinJob(text)
+	local id = tostring(text or ""):match("%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x")
+	if not id then
+		Fn.notify("Join Job ID", "Paste a valid Job ID first.")
+		return
+	end
+	Fn.queueReload()
+	pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, id, LocalPlayer) end)
+end
+
+-----------------------------------------------------------
+-- ANTI AFK + PERFORMANCE
+-----------------------------------------------------------
+
+function Fn.keepAlive()
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+end
+
+Fn.track(LocalPlayer.Idled:Connect(function()
+	if Fn.alive() and S.antiAfk then Fn.keepAlive() end
+end))
+
+task.spawn(function()
+	while Fn.alive() do
+		if S.antiAfk then Fn.keepAlive() end
+		task.wait(20)
+	end
+end)
+
+local lowGfxConn = nil
+
+function Fn.setLowGfx(on)
+	if lowGfxConn then
+		pcall(function() lowGfxConn:Disconnect() end)
+		lowGfxConn = nil
+	end
+	if not on then
+		pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic end)
+		return
+	end
+
+	task.spawn(function()
+		pcall(function()
+			local terrain = Workspace:FindFirstChildWhichIsA("Terrain")
+			if terrain then
+				terrain.WaterWaveSize = 0
+				terrain.WaterWaveSpeed = 0
+				terrain.WaterReflectance = 0
+				terrain.WaterTransparency = 1
+			end
+			Lighting.GlobalShadows = false
+			Lighting.FogEnd = 9e9
+			settings().Rendering.QualityLevel = 1
+
+			for i, inst in ipairs(Workspace:GetDescendants()) do
+				if inst:IsA("BasePart") then
+					inst.CastShadow = false
+					inst.Reflectance = 0
+				elseif inst:IsA("Decal") or inst:IsA("Texture") then
+					inst.Transparency = 1
+				elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") then
+					inst.Enabled = false
+				end
+				if i % 2000 == 0 then task.wait() end
+			end
+			for _, inst in ipairs(Lighting:GetDescendants()) do
+				if inst:IsA("PostEffect") then inst.Enabled = false end
+			end
+
+			lowGfxConn = Workspace.DescendantAdded:Connect(function(inst)
+				if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") then
+					task.defer(function() pcall(function() inst.Enabled = false end) end)
+				end
+			end)
+		end)
+	end)
+end
+
+-----------------------------------------------------------
+-- WEBHOOK (NisulRocks Script Hub)
+-----------------------------------------------------------
+
+-- Every message is branded as the NisulRocks Script Hub and goes through one
+-- queue, so a burst of events can never trip Discord's rate limit. What gets
+-- sent is chosen on the Webhook tab: eggs delivered, pets hatched, the pet team.
+
+local HUB = {
+	Name    = "NisulRocks Script Hub",
+	Game    = "Ride A Pet",
+	Version = "V1.0.2",
+	Invite  = "https://discord.gg/jUctfTAa5D",
+	Red     = 0xFF1E1E, -- the hub's neon red
+	Green   = 0x00FF78,
+	Blue    = 0x6464FF,
+}
+
+local EMBED_COLORS = {
+	Common = 9807270, Rare = 3447003, Epic = 10181046, Legendary = 15844367,
+	Mythic = 15158332, Divine = 16766720, Ethereal = 8454143,
+}
+
+local httpRequest = request or http_request or (syn and syn.request) or (http and http.request)
+local WebhookQueue = { items = {}, sent = 0, failed = 0, lastSentAt = nil, lastError = "" }
+
+function Fn.validWebhookUrl(url)
+	if type(url) ~= "string" then return false end
+	-- Only ever post to real Discord webhook endpoints.
+	return url:match("^https://discord%.com/api/webhooks/") ~= nil
+		or url:match("^https://discordapp%.com/api/webhooks/") ~= nil
+end
+
+local ABBREV_STEPS = { { 1e15, "qa" }, { 1e12, "t" }, { 1e9, "b" }, { 1e6, "m" }, { 1e3, "k" } }
+
+-- 12345 -> "12.35k".
+function Fn.abbrev(n)
+	if type(n) ~= "number" then return "?" end
+	for _, step in ipairs(ABBREV_STEPS) do
+		if n >= step[1] then
+			local text = string.format("%.2f", n / step[1]):gsub("%.?0+$", "")
+			return text .. step[2]
+		end
+	end
+	return tostring(math.floor(n + 0.5))
+end
+
+function Fn.clip(text, limit)
+	text = tostring(text)
+	return #text > limit and (text:sub(1, limit - 3) .. "...") or text
+end
+
+function Fn.buildEmbed(spec)
+	local who = S.whHideName and "Anonymous" or LocalPlayer.Name
+
+	local fields
+	if spec.fields then
+		fields = {}
+		for i, f in ipairs(spec.fields) do
+			if i > 25 then break end
+			fields[i] = { name = Fn.clip(f.name, 256), value = Fn.clip(f.value, 1024), inline = f.inline == true }
+		end
+	end
+
+	local embed = {
+		author = { name = HUB.Name .. "  //  " .. HUB.Game, url = HUB.Invite },
+		title = spec.title and Fn.clip(spec.title, 256) or nil,
+		description = spec.description and Fn.clip(spec.description, 4000) or nil,
+		color = spec.color or HUB.Red,
+		fields = fields,
+		footer = { text = string.format("%s  |  %s  |  discord.gg/jUctfTAa5D", who, HUB.Version) },
+		timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+	}
+	if not S.whHideName then
+		embed.thumbnail = { url = string.format(
+			"https://www.roblox.com/headshot-thumbnail/image?userId=%d&width=150&height=150&format=png", LocalPlayer.UserId) }
+	end
+	return embed
+end
+
+-- Queues a message: { title, description, color, fields = { { name, value, inline } } }.
+-- Returns false when no valid webhook URL is set or the executor cannot make requests.
+function Fn.post(spec)
+	if not httpRequest or not Fn.validWebhookUrl(S.webhookUrl) then return false end
+	if #WebhookQueue.items >= 20 then table.remove(WebhookQueue.items, 1) end
+	WebhookQueue.items[#WebhookQueue.items + 1] = spec
+	return true
+end
+
+task.spawn(function()
+	local nextAt = 0
+	while Fn.alive() do
+		local spec = WebhookQueue.items[1]
+		if spec and os.clock() >= nextAt and Fn.validWebhookUrl(S.webhookUrl) and httpRequest then
+			table.remove(WebhookQueue.items, 1)
+
+			local ok, res = pcall(function()
+				return httpRequest({
+					Url = S.webhookUrl,
+					Method = "POST",
+					Headers = { ["Content-Type"] = "application/json" },
+					Body = HttpService:JSONEncode({ username = HUB.Name, embeds = { Fn.buildEmbed(spec) } }),
+				})
+			end)
+
+			local status = ok and type(res) == "table" and (res.StatusCode or res.status_code) or nil
+			if ok and (status == nil or (status >= 200 and status < 300)) then
+				WebhookQueue.sent = WebhookQueue.sent + 1
+				WebhookQueue.lastSentAt = os.time()
+				nextAt = os.clock() + 1.5
+			elseif status == 429 then
+				table.insert(WebhookQueue.items, 1, spec) -- Discord asked us to slow down; retry
+				WebhookQueue.lastError = "rate limited (retrying)"
+				nextAt = os.clock() + 6
+			else
+				WebhookQueue.failed = WebhookQueue.failed + 1
+				WebhookQueue.lastError = ok and ("HTTP " .. tostring(status)) or tostring(res)
+				nextAt = os.clock() + 1.5
+			end
+		end
+		task.wait(0.3)
+	end
+end)
+
+function Fn.sendTest()
+	if not httpRequest then
+		Fn.notify("Webhook", "This executor cannot send web requests.")
+	elseif not Fn.validWebhookUrl(S.webhookUrl) then
+		Fn.notify("Webhook", "Paste a Discord webhook URL first.")
+	else
+		Fn.post({ title = "Test message", description = "The webhook is connected.", color = HUB.Green })
+		Fn.notify("Webhook", "Test message queued.")
+	end
+end
+
+-- Eggs -------------------------------------------------------------------------
+
+-- Remembers an egg taken from the map; it is reported once it reaches the plot.
+function Fn.noteEgg(egg)
+	Report.eggs[#Report.eggs + 1] = {
+		name = egg.name, rarity = Fn.eggRarity(egg.name), rank = egg.rank,
+		weight = tonumber(egg.node:GetAttribute("Weight")) or 1,
+	}
+end
+
+function Fn.reportEggs()
+	local eggs = Report.eggs
+	Report.eggs = {}
+	if not S.whEggs or #eggs == 0 then return end
+
+	local tally, order, topRank = {}, {}, 0
+	for _, egg in ipairs(eggs) do
+		if egg.rank >= S.whEggMinRank then
+			local row = tally[egg.name]
+			if not row then
+				row = { name = egg.name, rarity = egg.rarity, rank = egg.rank, count = 0, best = 0 }
+				tally[egg.name] = row
+				order[#order + 1] = row
+			end
+			row.count = row.count + 1
+			row.best = math.max(row.best, egg.weight)
+			topRank = math.max(topRank, egg.rank)
+		end
+	end
+	if #order == 0 then return end
+
+	table.sort(order, function(a, b)
+		if a.rank ~= b.rank then return a.rank > b.rank end
+		return a.count > b.count
+	end)
+
+	local lines, total = {}, 0
+	for _, row in ipairs(order) do
+		total = total + row.count
+		lines[#lines + 1] = string.format("**%dx %s** (%s) - heaviest %.2fkg", row.count, row.name, row.rarity, row.best)
+	end
+
+	Fn.post({
+		title = string.format("%d egg%s delivered", total, total == 1 and "" or "s"),
+		description = table.concat(lines, "\n"),
+		color = EMBED_COLORS[RARITIES[topRank]] or HUB.Red,
+		fields = {
+			{ name = "Session Eggs", value = tostring(Stat.delivered), inline = true },
+			{ name = "Cash", value = Fn.abbrev(Fn.cash()), inline = true },
+		},
+	})
+end
+
+-- Pets -------------------------------------------------------------------------
+
+function Fn.petRarity(name)
+	local data = Fn.petData(name)
+	return data and data.Rarity and tostring(data.Rarity) or nil
+end
+
+function Fn.petLine(pet)
+	local parts = { string.format("**%s**", pet.name) }
+	if pet.rarity then parts[#parts + 1] = pet.rarity end
+	parts[#parts + 1] = string.format("%.2fkg", pet.weight)
+	if pet.mutation then parts[#parts + 1] = tostring(pet.mutation) end
+	parts[#parts + 1] = "score " .. Fn.abbrev(pet.score)
+	return table.concat(parts, " | ")
+end
+
+-- A pet tool that has turned up and was never seen before is a new pet.
+function Fn.onPetAdded(tool)
+	if not tool:IsA("Tool") then return end
+
+	local deadline = os.clock() + 1
+	while tool:GetAttribute("PetKey") == nil and os.clock() < deadline do task.wait(0.1) end
+
+	local char = LocalPlayer.Character
+	if not (tool:IsDescendantOf(LocalPlayer) or (char and tool:IsDescendantOf(char))) then return end
+
+	local key = tool:GetAttribute("PetKey") or tool
+	if Report.petSeen[key] then return end
+	Report.petSeen[key] = true
+
+	local name = Fn.petNameOf(tool)
+	Report.pets[#Report.pets + 1] = {
+		name = name, rarity = Fn.petRarity(name), weight = tonumber(tool:GetAttribute("Weight")) or 1,
+		mutation = tool:GetAttribute("Mutation"), score = Fn.toolScore(tool),
+	}
+end
+
+Fn.track(CollectionService:GetInstanceAddedSignal("Pet"):Connect(function(tool)
+	task.spawn(Fn.onPetAdded, tool)
+end))
+
+-- Pets we already own are not news: remember the ones in the backpack and on the plot.
+function Fn.seedPets(includeTools)
+	if includeTools then
+		for _, tool in ipairs(Fn.tools("Pet")) do Report.petSeen[tool:GetAttribute("PetKey") or tool] = true end
+	end
+	for _, pet in ipairs(Fn.plotPets()) do
+		local key = pet:GetAttribute("PetKey")
+		if key then Report.petSeen[key] = true end
+	end
+end
+
+function Fn.reportPets(pets)
+	if not S.whPets then return end
+
+	local shown = {}
+	for _, pet in ipairs(pets) do
+		if (RARITY_RANK[pet.rarity] or 0) >= S.whPetMinRank then shown[#shown + 1] = pet end
+	end
+	if #shown == 0 then return end
+
+	table.sort(shown, function(a, b) return a.score > b.score end)
+
+	local lines, topRank = {}, 0
+	for i, pet in ipairs(shown) do
+		if i <= 15 then lines[#lines + 1] = Fn.petLine(pet) end
+		topRank = math.max(topRank, RARITY_RANK[pet.rarity] or 0)
+	end
+	if #shown > 15 then lines[#lines + 1] = string.format("...and %d more", #shown - 15) end
+
+	Fn.post({
+		title = string.format("%d pet%s hatched", #shown, #shown == 1 and "" or "s"),
+		description = table.concat(lines, "\n"),
+		color = EMBED_COLORS[RARITIES[topRank]] or HUB.Blue,
+		fields = {
+			{ name = "Session Hatches", value = tostring(Stat.hatched), inline = true },
+			{ name = "Best Pet", value = shown[1].name, inline = true },
+		},
+	})
+end
+
+-- Pet team ---------------------------------------------------------------------
+
+function Fn.teamSnapshot()
+	local team = {}
+	for _, pet in ipairs(Fn.plotPets()) do
+		local name = Fn.petNameOf(pet)
+		team[#team + 1] = {
+			name = name, rarity = Fn.petRarity(name), weight = tonumber(pet:GetAttribute("Weight")) or 1,
+			mutation = pet:GetAttribute("Mutation"), score = Fn.placedScore(pet),
+		}
+	end
+	table.sort(team, function(a, b) return a.score > b.score end)
+	return team
+end
+
+function Fn.reportTeam()
+	local team = Fn.teamSnapshot()
+	if #team == 0 then
+		Fn.post({ title = "Current pet team", description = "No pets are placed.", color = HUB.Blue })
+		return
+	end
+
+	local lines, total = {}, 0
+	for i, pet in ipairs(team) do
+		total = total + pet.score
+		if i <= 20 then lines[#lines + 1] = string.format("%d. %s", i, Fn.petLine(pet)) end
+	end
+	if #team > 20 then lines[#lines + 1] = string.format("...and %d more", #team - 20) end
+
+	Fn.post({
+		title = string.format("Current pet team (%d/%d)", #team, Fn.maxPets()),
+		description = table.concat(lines, "\n"),
+		color = HUB.Blue,
+		fields = {
+			{ name = "Team Score", value = Fn.abbrev(total), inline = true },
+			{ name = "Strongest", value = team[1].name, inline = true },
+		},
+	})
+end
+
+function Fn.reportTeamNow()
+	if not Fn.validWebhookUrl(S.webhookUrl) then
+		Fn.notify("Webhook", "Paste a Discord webhook URL first.")
+		return
+	end
+	Fn.reportTeam()
+	Report.teamSentAt = os.clock()
+	Fn.notify("Webhook", "Pet team queued.")
+end
+
+-- Hatched pets go out in batches, the team after it settles, or on a timer.
+task.spawn(function()
+	local lastPlot = 0
+	while Fn.alive() do
+		local now = os.clock()
+
+		if #Report.pets > 0 then
+			local pets = Report.pets
+			Report.pets = {}
+			Fn.reportPets(pets)
+		end
+
+		if now - lastPlot > 2 then
+			lastPlot = now
+			Fn.seedPets(false)
+		end
+
+		if S.whTeam then
+			if Report.teamDirtyAt and now - Report.teamDirtyAt > 15 then
+				Report.teamDirtyAt = nil
+				Report.teamSentAt = now
+				Fn.reportTeam()
+			elseif S.whTeamEvery > 0 and now - Report.teamSentAt >= S.whTeamEvery * 60 then
+				Report.teamSentAt = now
+				Fn.reportTeam()
+			end
+		else
+			Report.teamDirtyAt = nil
+		end
+		task.wait(3)
+	end
+end)
+
+-----------------------------------------------------------
+-- UI
+-----------------------------------------------------------
+
+local ok, Rayfield = pcall(function()
+	return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+end)
+
+if not ok or not Rayfield then
+	warn("[RAP] Rayfield failed to load")
+	return
+end
+
+env.NisulRAPRayfield = Rayfield
+
+local UIErrors = {}
+local StatusParagraph, StatsParagraph, WebhookParagraph
+
+function Fn.notify(title, content, duration)
+	pcall(function()
+		Rayfield:Notify({ Title = title, Content = content, Duration = duration or 4, Image = ICON_ID })
+	end)
+end
+
+-- Rayfield throwing on one malformed element aborts every statement after it.
+-- Isolate each element so one bad option cannot take a whole tab down.
+function Fn.safeUI(label, builder)
+	local built, result = pcall(builder)
+	if not built then
+		UIErrors[#UIErrors + 1] = string.format("%s -> %s", label, tostring(result))
+		warn(string.format("[RAP] UI element %q failed: %s", label, tostring(result)))
+		return nil
+	end
+	return result
+end
+
+-- Rayfield hands multi-select dropdowns back as an array; flip it into a set.
+function Fn.toSet(selected)
+	local set = {}
+	if type(selected) == "table" then
+		for _, name in ipairs(selected) do set[name] = true end
+	elseif type(selected) == "string" then
+		set[selected] = true
+	end
+	return set
+end
+
+function Fn.firstOption(option)
+	return type(option) == "table" and option[1] or option
+end
+
+local Window = Rayfield:CreateWindow({
+	Name = "Ride A Pet V1.0.2",
+	LoadingTitle = "RAP Auto Farm V1.0.2",
+	LoadingSubtitle = "by NisulRocks | Made with love",
+	ShowText = "RAP Auto Farm",
+	Theme = "Default",
+	ToggleUIKeybind = "K",
+	Discord = { Enabled = true, Invite = "jUctfTAa5D", RememberJoins = true },
+	ConfigurationSaving = { Enabled = true, FolderName = "NisulRocks RAP", FileName = "RAP_AutoFarm_V1" },
+	KeySystem = false,
+})
+
+function Fn.addToggle(tab, label, name, flag, default, onChange)
+	return Fn.safeUI(label, function()
+		return tab:CreateToggle({
+			Name = name, CurrentValue = default, Flag = flag,
+			Callback = function(v) onChange(v) end,
+		})
+	end)
+end
+
+function Fn.addSlider(tab, label, name, flag, range, increment, suffix, default, onChange)
+	return Fn.safeUI(label, function()
+		return tab:CreateSlider({
+			Name = name, Range = range, Increment = increment, Suffix = suffix,
+			CurrentValue = default, Flag = flag,
+			Callback = function(v) onChange(v) end,
+		})
+	end)
+end
+
+function Fn.addDropdown(tab, label, name, flag, options, default, multi, onChange)
+	return Fn.safeUI(label, function()
+		return tab:CreateDropdown({
+			Name = name, Options = options, CurrentOption = default,
+			MultipleOptions = multi, Flag = flag,
+			Callback = function(selected) onChange(selected) end,
+		})
+	end)
+end
+
+function Fn.addButton(tab, label, name, onClick)
+	return Fn.safeUI(label, function()
+		return tab:CreateButton({
+			Name = name,
+			Callback = function() task.spawn(onClick) end,
+		})
+	end)
+end
+
+function Fn.addSection(tab, name)
+	Fn.safeUI("Section/" .. name, function() tab:CreateSection(name) end)
+end
+
+-- Dashboard ----------------------------------------------------------------------
+
+local DashboardTab = Window:CreateTab("Dashboard", ICON_ID)
+Fn.addSection(DashboardTab, "Session")
+
+StatusParagraph = Fn.safeUI("Dash/Status", function()
+	return DashboardTab:CreateParagraph({ Title = "Status", Content = "Idle" })
+end)
+
+StatsParagraph = Fn.safeUI("Dash/Stats", function()
+	return DashboardTab:CreateParagraph({ Title = "Statistics", Content = "Gathering..." })
+end)
+
+Fn.addButton(DashboardTab, "Dash/Discord", "Copy Discord Invite", function()
+	if typeof(setclipboard) == "function" then
+		pcall(setclipboard, "https://discord.gg/jUctfTAa5D")
+		Fn.notify("Discord", "Invite copied to your clipboard.")
+	end
+end)
+
+Fn.addButton(DashboardTab, "Dash/Unload", "Unload Script", function()
+	S.unloaded = true
+	for _, conn in ipairs(Conns) do pcall(function() conn:Disconnect() end) end
+	Fn.espStop()
+	Fn.restorePrompts()
+	Fn.setNoclip(false)
+	pcall(function() RunService:Set3dRenderingEnabled(true) end)
+	pcall(function() Rayfield:Destroy() end)
+end)
+
+-- Farm ---------------------------------------------------------------------------
+
+local FarmTab = Window:CreateTab("Farm", ICON_ID)
+
+-- Egg names from the game's own list, best first.
+local EGG_NAMES = {}
+do
+	local eggs = Fn.data("Eggs")
+	local rows = {}
+	for name, egg in pairs(eggs or {}) do
+		if type(egg) == "table" then
+			rows[#rows + 1] = { name = name, rank = RARITY_RANK[tostring(egg.Rarity)] or 0, luck = tonumber(egg.Luck) or 0 }
+		end
+	end
+	table.sort(rows, function(a, b)
+		if a.rank ~= b.rank then return a.rank > b.rank end
+		return a.luck > b.luck
+	end)
+	for _, row in ipairs(rows) do EGG_NAMES[#EGG_NAMES + 1] = row.name end
+end
+
+local PRIORITIES = { "Highest Luck", "Highest Rarity", "Nearest", "Farthest" }
+
+Fn.addSection(FarmTab, "Auto Collect Eggs")
+Fn.addToggle(FarmTab, "Farm/Collect", "Auto Collect Eggs", "AutoCollect", false, function(v) S.autoCollect = v end)
+Fn.addDropdown(FarmTab, "Farm/MinRank", "Min Egg Rarity", "MinEggRarity", RARITY_CHOICES, { "Any" }, false, function(s)
+	S.minEggRank = RARITY_RANK[Fn.firstOption(s)] or 0
+end)
+Fn.addDropdown(FarmTab, "Farm/Targets", "Target Eggs", "TargetEggs", EGG_NAMES, {}, true, function(s)
+	S.targetEggs = Fn.toSet(s)
+end)
+Fn.addDropdown(FarmTab, "Farm/Priority", "Collect Priority", "CollectPriority", PRIORITIES, { "Highest Rarity" }, false, function(s)
+	S.collectPriority = Fn.firstOption(s)
+end)
+Fn.addSlider(FarmTab, "Farm/Speed", "Tween Speed", "FlySpeed", { 100, 1300 }, 25, " studs/s", S.flySpeed, function(v)
+	S.flySpeed = math.clamp(tonumber(v) or 600, 100, 1300)
+end)
+
+Fn.addSection(FarmTab, "Auto Plant & Hatch")
+Fn.addToggle(FarmTab, "Farm/Plant", "Auto Plant Eggs", "AutoPlant", false, function(v)
+	S.autoPlant = v
+	nextPlantAt = 0 -- the first run is straight away
+end)
+Fn.addSlider(FarmTab, "Farm/PlantEvery", "Plant Every", "PlantEvery", { 0.5, 60 }, 0.5, " min", S.plantEvery, function(v)
+	S.plantEvery = tonumber(v) or 5
+end)
+Fn.addDropdown(FarmTab, "Farm/PlantRank", "Plant Min Rarity", "PlantMinRarity", RARITY_CHOICES, { "Any" }, false, function(s)
+	S.plantMinRank = RARITY_RANK[Fn.firstOption(s)] or 0
+end)
+Fn.addButton(FarmTab, "Farm/PlantNow", "Plant Now", function() nextPlantAt = 0 end)
+Fn.addToggle(FarmTab, "Farm/Hatch", "Auto Hatch Eggs", "AutoHatch", false, function(v)
+	S.autoHatch = v
+	nextHatchAt = 0
+end)
+Fn.addSlider(FarmTab, "Farm/HatchEvery", "Hatch Every", "HatchEvery", { 0.5, 60 }, 0.5, " min", S.hatchEvery, function(v)
+	S.hatchEvery = tonumber(v) or 5
+end)
+Fn.addButton(FarmTab, "Farm/HatchNow", "Hatch Now", function() nextHatchAt = 0 end)
+
+-- Pets ---------------------------------------------------------------------------
+
+local PetsTab = Window:CreateTab("Pets & Shop", ICON_ID)
+
+local FOOD_NAMES, GEAR_NAMES = Fn.shopItems("Food"), Fn.shopItems("Gears")
+
+Fn.addSection(PetsTab, "Auto Pets")
+Fn.addToggle(PetsTab, "Pets/Place", "Auto Place Best Pets", "AutoPlace", false, function(v) S.autoPlace = v end)
+Fn.addToggle(PetsTab, "Pets/Swap", "Swap Weaker Pets", "SwapWeaker", false, function(v) S.swapWeaker = v end)
+Fn.addToggle(PetsTab, "Pets/Feed", "Auto Feed Pets", "AutoFeed", false, function(v)
+	S.autoFeed = v
+	table.clear(FedAt)
+end)
+Fn.addDropdown(PetsTab, "Pets/Foods", "Foods To Use", "FeedFoods", FOOD_NAMES, {}, true, function(s)
+	S.feedFoods = Fn.toSet(s)
+end)
+
+Fn.addSection(PetsTab, "Auto Shop")
+Fn.addToggle(PetsTab, "Shop/Food", "Auto Buy Food", "AutoBuyFood", false, function(v) S.autoBuyFood = v end)
+Fn.addDropdown(PetsTab, "Shop/FoodList", "Food To Buy", "BuyFoods", FOOD_NAMES, {}, true, function(s)
+	S.buyFoods = Fn.toSet(s)
+end)
+Fn.addToggle(PetsTab, "Shop/Gear", "Auto Buy Radars", "AutoBuyGear", false, function(v) S.autoBuyGear = v end)
+Fn.addDropdown(PetsTab, "Shop/GearList", "Radars To Buy", "BuyGears", GEAR_NAMES, {}, true, function(s)
+	S.buyGears = Fn.toSet(s)
+end)
+Fn.addSlider(PetsTab, "Shop/Keep", "Keep Cash", "KeepCash", { 0, 100000000 }, 1000, "", S.keepCash, function(v)
+	S.keepCash = math.max(0, tonumber(v) or 0)
+end)
+
+Fn.addSection(PetsTab, "Auto Progress")
+Fn.addToggle(PetsTab, "Progress/Rebirth", "Auto Rebirth", "AutoRebirth", false, function(v) S.autoRebirth = v end)
+Fn.addToggle(PetsTab, "Progress/Index", "Auto Claim Index Reward", "AutoIndex", false, function(v) S.autoIndex = v end)
+Fn.addToggle(PetsTab, "Progress/Luck", "Auto Max Hatch Luck", "AutoLuck", false, function(v)
+	S.autoLuck = v
+	nextLuckAt = 0 -- the first run is straight away
+end)
+Fn.addSlider(PetsTab, "Progress/LuckEvery", "Max Luck Every", "LuckEvery", { 0.5, 60 }, 0.5, " min", S.luckEvery, function(v)
+	S.luckEvery = tonumber(v) or 5
+end)
+Fn.addButton(PetsTab, "Progress/LuckNow", "Max Hatch Luck Now", function() nextLuckAt = 0 end)
+
+-- Player -------------------------------------------------------------------------
+
+local PlayerTab = Window:CreateTab("Player", ICON_ID)
+
+Fn.addSection(PlayerTab, "Movement")
+Fn.addToggle(PlayerTab, "Player/Speed", "Speed Boost", "SpeedBoost", false, function(v) S.speedBoost = v end)
+Fn.addSlider(PlayerTab, "Player/SpeedValue", "Boost Speed", "BoostSpeed", { 16, 1300 }, 1, "", S.boostSpeed, function(v)
+	S.boostSpeed = math.clamp(tonumber(v) or 60, 16, 1300)
+end)
+Fn.addToggle(PlayerTab, "Player/InfJump", "Infinite Jump", "InfJump", false, function(v) S.infJump = v end)
+Fn.addToggle(PlayerTab, "Player/Noclip", "Noclip", "Noclip", false, function(v) S.noclip = v end)
+Fn.addToggle(PlayerTab, "Player/Instant", "Instant Pickup", "InstantPickup", false, function(v)
+	S.instantPickup = v
+	Fn.setInstantPickup(v)
+end)
+
+Fn.addSection(PlayerTab, "ESP")
+Fn.addToggle(PlayerTab, "Player/Esp", "ESP Eggs", "EspEggs", false, function(v)
+	S.espEggs = v
+	if v then Fn.espStart() else Fn.espStop() end
+end)
+Fn.addDropdown(PlayerTab, "Player/EspRank", "ESP Min Rarity", "EspMinRarity", RARITY_CHOICES, { "Any" }, false, function(s)
+	S.espMinRank = RARITY_RANK[Fn.firstOption(s)] or 0
+	if S.espEggs then Fn.espStart() end
+end)
+Fn.addSlider(PlayerTab, "Player/EspLabels", "ESP Max Labels", "EspMaxLabels", { 3, 30 }, 1, "", S.espMaxLabels, function(v)
+	S.espMaxLabels = math.floor(tonumber(v) or 10)
+end)
+Fn.addSlider(PlayerTab, "Player/EspDist", "ESP Max Distance", "EspMaxDist", { 100, 10000 }, 100, " m", S.espMaxDist, function(v)
+	S.espMaxDist = tonumber(v) or 4000
+end)
+
+-- Server -------------------------------------------------------------------------
+
+local ServerTab = Window:CreateTab("Server", ICON_ID)
+
+Fn.addSection(ServerTab, "Server")
+Fn.addToggle(ServerTab, "Server/Reload", "Reload Script After Teleport", "AutoReload", true, function(v) S.autoReload = v end)
+Fn.addDropdown(ServerTab, "Server/Mode", "Server Hop Mode", "HopMode", { "Most Players", "Random", "Least Players" }, { "Least Players" }, false, function(s)
+	S.hopMode = Fn.firstOption(s) or "Least Players"
+end)
+Fn.addButton(ServerTab, "Server/Hop", "Server Hop", Fn.serverHop)
+
+local jobInput = ""
+Fn.safeUI("Server/JobId", function()
+	return ServerTab:CreateInput({
+		Name = "Job ID", CurrentValue = "", PlaceholderText = "Paste a server Job ID...",
+		RemoveTextAfterFocusLost = false, Flag = "JobIdInput",
+		Callback = function(text) jobInput = text end,
+	})
+end)
+Fn.addButton(ServerTab, "Server/Join", "Join Job ID", function() Fn.joinJob(jobInput) end)
+Fn.addButton(ServerTab, "Server/Copy", "Copy Current Job ID", function()
+	if typeof(setclipboard) == "function" then pcall(setclipboard, tostring(game.JobId)) end
+	Fn.notify("Job ID", tostring(game.JobId))
+end)
+Fn.addButton(ServerTab, "Server/Rejoin", "Rejoin Server", Fn.rejoin)
+
+-- Webhook ------------------------------------------------------------------------
+
+local WebhookTab = Window:CreateTab("Webhook", ICON_ID)
+
+Fn.addSection(WebhookTab, "Connection")
+Fn.safeUI("Webhook/URL", function()
+	return WebhookTab:CreateInput({
+		Name = "Webhook URL", CurrentValue = "", PlaceholderText = "https://discord.com/api/webhooks/...",
+		RemoveTextAfterFocusLost = false, Flag = "WebhookURL",
+		Callback = function(text) S.webhookUrl = text end,
+	})
+end)
+Fn.addToggle(WebhookTab, "Webhook/Hide", "Hide My Username & Avatar", "WebhookHideName", false, function(v) S.whHideName = v end)
+Fn.addButton(WebhookTab, "Webhook/Test", "Send Test Message", Fn.sendTest)
+
+Fn.addSection(WebhookTab, "Data To Send")
+Fn.addToggle(WebhookTab, "Webhook/Eggs", "Eggs Delivered", "WebhookEggs", false, function(v) S.whEggs = v end)
+Fn.addDropdown(WebhookTab, "Webhook/EggRank", "Min Egg Rarity", "WebhookEggMin", RARITY_CHOICES, { "Any" }, false, function(s)
+	S.whEggMinRank = RARITY_RANK[Fn.firstOption(s)] or 0
+end)
+Fn.addToggle(WebhookTab, "Webhook/Pets", "Pets Hatched", "WebhookPets", false, function(v) S.whPets = v end)
+Fn.addDropdown(WebhookTab, "Webhook/PetRank", "Min Pet Rarity", "WebhookPetMin", RARITY_CHOICES, { "Any" }, false, function(s)
+	S.whPetMinRank = RARITY_RANK[Fn.firstOption(s)] or 0
+end)
+Fn.addToggle(WebhookTab, "Webhook/Team", "Pet Team", "WebhookTeam", false, function(v) S.whTeam = v end)
+Fn.addSlider(WebhookTab, "Webhook/TeamEvery", "Team Report Every (0 = on change only)", "WebhookTeamEvery", { 0, 240 }, 5, " min", 0, function(v)
+	S.whTeamEvery = tonumber(v) or 0
+end)
+Fn.addButton(WebhookTab, "Webhook/TeamNow", "Send Pet Team Now", Fn.reportTeamNow)
+
+Fn.addSection(WebhookTab, "Status")
+WebhookParagraph = Fn.safeUI("Webhook/Status", function()
+	return WebhookTab:CreateParagraph({ Title = "Webhook Status", Content = "Not configured" })
+end)
+
+-- Script -------------------------------------------------------------------------
+
+local ScriptTab = Window:CreateTab("Script", ICON_ID)
+
+Fn.addSection(ScriptTab, "Performance")
+Fn.addToggle(ScriptTab, "Script/AntiAfk", "Anti AFK", "AntiAfk", true, function(v) S.antiAfk = v end)
+Fn.addToggle(ScriptTab, "Script/NoRender", "Disable 3D Rendering (biggest FPS save)", "NoRender", false, function(v)
+	S.noRender = v
+	pcall(function() RunService:Set3dRenderingEnabled(not v) end)
+end)
+Fn.addToggle(ScriptTab, "Script/LowGfx", "Low Graphics Mode (rejoin restores)", "LowGfx", false, function(v)
+	S.lowGfx = v
+	Fn.setLowGfx(v)
+end)
+Fn.addSlider(ScriptTab, "Script/Fps", "FPS Cap", "FpsCap", { 30, 1000 }, 1, " FPS", 240, function(v)
+	if typeof(setfpscap) == "function" then pcall(setfpscap, math.clamp(math.floor(tonumber(v) or 240), 30, 1000)) end
+end)
+
+-----------------------------------------------------------
+-- DASHBOARD REFRESH
+-----------------------------------------------------------
+
+function Fn.duration(seconds)
+	seconds = math.max(0, math.floor(seconds))
+	return string.format("%dh %02dm %02ds", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60), seconds % 60)
+end
+
+task.spawn(function()
+	local lastStatus
+	while Fn.alive() do
+		if StatusParagraph and S.status ~= lastStatus then
+			lastStatus = S.status
+			pcall(function() StatusParagraph:Set({ Title = "Status", Content = tostring(S.status) }) end)
+		end
+
+		if StatsParagraph then
+			pcall(function()
+				StatsParagraph:Set({
+					Title = "Statistics",
+					Content = string.format(
+						"Uptime: %s\nEggs taken: %d | Delivered: %d\nPlanted: %d | Hatched: %d\nPets placed: %d | Fed: %d\nBought: %d | Rebirths: %d | Luck runs: %d\nBasket: %d/%d | Cash: %s",
+						Fn.duration(os.time() - Stat.startTime),
+						Stat.picked, Stat.delivered, Stat.planted, Stat.hatched, Stat.placed, Stat.fed,
+						Stat.bought, Stat.rebirths, Stat.luckRuns, Fn.basketCount(), Fn.basketCapacity(), tostring(Fn.cash())),
+				})
+			end)
+		end
+
+		if WebhookParagraph then
+			pcall(function()
+				local urlState = Fn.validWebhookUrl(S.webhookUrl) and "ready"
+					or (S.webhookUrl == "" and "no URL set" or "not a Discord webhook URL")
+				local lines = {
+					string.format("URL: %s%s", urlState, httpRequest and "" or " | executor cannot send HTTP"),
+					string.format("Sent: %d | Failed: %d | Queued: %d", WebhookQueue.sent, WebhookQueue.failed, #WebhookQueue.items),
+					WebhookQueue.lastSentAt and ("Last sent: " .. Fn.duration(os.time() - WebhookQueue.lastSentAt) .. " ago")
+						or "Nothing sent yet",
+				}
+				if WebhookQueue.lastError ~= "" then lines[#lines + 1] = "Last error: " .. WebhookQueue.lastError end
+				WebhookParagraph:Set({ Title = "Webhook Status", Content = table.concat(lines, "\n") })
+			end)
+		end
+		task.wait(1)
+	end
+end)
+
+-----------------------------------------------------------
+-- BOOT
+-----------------------------------------------------------
+
+-- Pets already owned are not news.
+pcall(Fn.seedPets, true)
+
+-- Applies saved toggle/slider values; callbacks then drive S.
+pcall(function() Rayfield:LoadConfiguration() end)
+
+-- A stale copy that lost the generation race tears its own window down.
+if not Fn.alive() then
+	pcall(function() Rayfield:Destroy() end)
+	return
+end
+
+print("Nisulrocks Scripts Ride A Pet AutoFarm V1.0.2 loaded successfully!")
+if #UIErrors > 0 then
+	warn("[RAP] " .. #UIErrors .. " UI element(s) failed to build")
+end
+
+Fn.notify("System Ready", "Welcome to NisulRocks RAP AutoFarm V1.0.2", 5)
+
+end)
