@@ -76,7 +76,8 @@ local S = {
 	minEggRank      = 0,
 	targetEggs      = {},          -- set of egg names; empty = any
 	collectPriority = "Highest Rarity",
-	flySpeed        = 600,
+	flySpeed        = 1300,
+	ridePet         = true,        -- mount the best pet before heading out for eggs
 
 	-- planting and hatching
 	autoPlant       = false,
@@ -145,6 +146,7 @@ local Stat = {
 	startTime = os.time(),
 	picked    = 0,
 	delivered = 0,
+	refused   = 0,
 	planted   = 0,
 	hatched   = 0,
 	placed    = 0,
@@ -299,7 +301,9 @@ local plotCache = nil
 -- The plot whose Data.Owner is us.
 function Fn.plot()
 	local function owned(plot)
-		local data = plot and plot:FindFirstChild("Data")
+		if not plot then return false end
+		if tonumber(plot:GetAttribute("NestsOwnerLoaded")) == LocalPlayer.UserId then return true end
+		local data = plot:FindFirstChild("Data")
 		local owner = data and data:FindFirstChild("Owner")
 		return owner ~= nil and owner.Value == LocalPlayer
 	end
@@ -488,16 +492,27 @@ function Fn.travelTime(from, to)
 	return total / math.max(S.flySpeed, 20)
 end
 
+-- Time to follow `route` from `from` when each leg has its own speed.
+function Fn.routeTime(from, route, speeds)
+	local total, here = 0, from
+	for index, point in ipairs(route) do
+		total = total + (point - here).Magnitude / math.max(speeds and speeds[index] or S.flySpeed, 20)
+		here = point
+	end
+	return total
+end
+
 -- Flies to `target`, stopping within `reach` studs. `abort` ends it early.
--- Returns true if we arrived.
-function Fn.flyTo(target, abort, reach)
+-- `route` (points ending at the target) and `speeds` (one per leg) replace the
+-- default cruise path. Returns true if we arrived.
+function Fn.flyTo(target, abort, reach, route, speeds)
 	local root = Fn.root()
 	if not root or typeof(target) ~= "Vector3" then return false end
 	reach = reach or 3
 	if (root.Position - target).Magnitude <= reach then return true end
 
-	local route = Fn.route(root.Position, target)
-	local deadline = os.clock() + Fn.travelTime(root.Position, target) + 6
+	route = route or Fn.route(root.Position, target)
+	local deadline = os.clock() + Fn.routeTime(root.Position, route, speeds) + 6
 	Fn.setNoclip(true)
 
 	-- The game re-enables collisions as parts are added; keep them off in flight.
@@ -524,7 +539,8 @@ function Fn.flyTo(target, abort, reach)
 			if last then arrived = true break end
 			index = index + 1
 		else
-			local step = math.min(distance, math.max(S.flySpeed, 20) * dt)
+			local speed = math.max(speeds and speeds[index] or S.flySpeed, 20)
+			local step = math.min(distance, speed * dt)
 			local flat = Vector3.new(offset.X, 0, offset.Z)
 			local rotation = flat.Magnitude > 0.1 and CFrame.lookAt(Vector3.zero, flat.Unit) or root.CFrame.Rotation
 			pcall(function()
@@ -554,6 +570,133 @@ function Fn.firePrompt(prompt)
 		task.wait(prompt.HoldDuration + 0.1)
 		prompt:InputHoldEnd()
 	end))
+end
+
+-----------------------------------------------------------
+-- RIDING
+-----------------------------------------------------------
+
+-- Plot.Pets.<pet>.RootPart.RidePrompt, or any prompt in the pet offering a ride.
+function Fn.ridePrompt(pet)
+	local root = pet:FindFirstChild("RootPart")
+	local prompt = root and root:FindFirstChild("RidePrompt")
+	if prompt and prompt:IsA("ProximityPrompt") then return prompt, root end
+	for _, inst in ipairs(pet:GetDescendants()) do
+		if inst:IsA("ProximityPrompt") and string.find(string.lower(inst.ActionText .. inst.Name), "ride", 1, true) then
+			return inst, root or inst.Parent
+		end
+	end
+	return nil
+end
+
+function Fn.petSpeed(pet)
+	local data = pet:FindFirstChild("Data")
+	local speed = data and data:FindFirstChild("Speed")
+	return speed and tonumber(speed.Value) or 0
+end
+
+-- The fastest pet on our plot that can be ridden.
+function Fn.bestRide()
+	local plot = Fn.plot()
+	local folder = plot and plot:FindFirstChild("Pets")
+	if not folder then return nil end
+	local best, bestSpeed, bestWeight
+	for _, pet in ipairs(folder:GetChildren()) do
+		if Fn.ridePrompt(pet) then
+			local speed = Fn.petSpeed(pet)
+			local weight = tonumber(pet:GetAttribute("Weight")) or 0
+			if not best or speed > bestSpeed or (speed == bestSpeed and weight > bestWeight) then
+				best, bestSpeed, bestWeight = pet, speed, weight
+			end
+		end
+	end
+	return best
+end
+
+-- True while the character is on the given pet.
+function Fn.isRiding(pet)
+	local hum, root = Fn.humanoid(), Fn.root()
+	if not (hum and root) then return false end
+	if hum.SeatPart ~= nil then return true end
+	if pet and pet.Parent then
+		local ok, joints = pcall(function() return root:GetJoints() end)
+		if ok then
+			for _, joint in ipairs(joints) do
+				-- GetJoints also returns constraints (LinearVelocity and the like) that have
+				-- no Part0/Part1, so read the ends defensively.
+				local a, b
+				pcall(function() a, b = joint.Part0, joint.Part1 end)
+				if not (a or b) then
+					pcall(function() a, b = joint.Attachment0 and joint.Attachment0.Parent, joint.Attachment1 and joint.Attachment1.Parent end)
+				end
+				local other = a == root and b or a
+				if typeof(other) == "Instance" and other:IsDescendantOf(pet) then return true end
+			end
+		end
+		local prompt = Fn.ridePrompt(pet)
+		if prompt and prompt.ActionText ~= "" and not string.find(string.lower(prompt.ActionText), "ride", 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Gets off the pet; planting, hatching and placing do not work while mounted.
+-- Always returns true so it can sit in front of a job in an `and` chain.
+function Fn.dismount()
+	if not Fn.ridingPet then return true end
+	if not Fn.isRiding(Fn.ridingPet) then
+		Fn.ridingPet = nil
+		return true
+	end
+	for _ = 1, 3 do
+		Fn.fire("PetDismount")
+		local wait = os.clock() + 1
+		while os.clock() < wait and Fn.alive() do
+			if not Fn.isRiding(Fn.ridingPet) then
+				Fn.ridingPet = nil
+				return true
+			end
+			RunService.Heartbeat:Wait()
+		end
+	end
+	return true
+end
+
+-- Goes to the best pet and takes its ride prompt. Returns true once riding.
+function Fn.mountBest(abort)
+	local pet = Fn.bestRide()
+	if not pet then
+		S.status = "No pet to ride"
+		return false
+	end
+	if Fn.isRiding(pet) then return true end
+
+	for attempt = 1, 3 do
+		if abort and abort() then return false end
+		local prompt, root = Fn.ridePrompt(pet)
+		if not (prompt and root and root.Parent) then return false end
+
+		S.status = "Mounting " .. pet.Name
+		Fn.flyTo(root.Position + Vector3.new(0, 3, 3), abort, 5)
+		Fn.firePrompt(prompt)
+
+		local wait = os.clock() + 1.5
+		while os.clock() < wait and Fn.alive() do
+			if Fn.isRiding(pet) then
+				-- Remember how high the saddle sits above the ground for the trip home.
+				local after, top = Fn.root(), Fn.plotTop()
+				task.wait(0.3)
+				after = Fn.root()
+				Fn.ridingPet = pet
+				Fn.rideHeight = after and top and math.clamp(after.Position.Y - top.Y, 2, 15) or nil
+				return true
+			end
+			RunService.Heartbeat:Wait()
+		end
+	end
+	S.status = "Could not mount " .. pet.Name
+	return false
 end
 
 -----------------------------------------------------------
@@ -593,7 +736,7 @@ function Fn.eggCandidates(from)
 			local rank = Fn.eggRank(name)
 			if rank >= S.minEggRank and (next(S.targetEggs) == nil or S.targetEggs[name]) then
 				-- Only eggs that can still make it home before they break.
-				if not top or Fn.travelTime(pos, top) < EGG_LIFETIME - EGG_MARGIN then
+				if not top or Fn.homeTime(pos, top) < EGG_LIFETIME - EGG_MARGIN then
 					list[#list + 1] = {
 						node = node, name = name, pos = pos, rank = rank,
 						luck = Fn.eggLuck(name) * weight, dist = (pos - from).Magnitude,
@@ -618,6 +761,110 @@ function Fn.eggCandidates(from)
 	return list
 end
 
+-- DELIVERY ------------------------------------------------------------------------
+-- The server's anti-teleport check turns a delivery down ("Egg Delivery Failed | CODE
+-- AT-xxxx", the egg is returned, TeleportFlags goes up) when the player carried the egg
+-- through the air; the game's own plot teleport is refused while holding an egg. So the
+-- way home stays on the ground: the character follows the terrain at standing height
+-- instead of cutting across the sky.
+
+local MAX_DELIVERY_FAILS = 4   -- failed deliveries in a row before collecting stops
+local HOME_FACTOR        = 1.15 -- slack on the estimated trip home
+local CARRY_SPEED        = 200  -- the most the server lets a carried egg travel at, studs/s
+
+local Delivery = {
+	failedAt = -1000,            -- when the game last reported a failed delivery
+	flags    = tonumber(LocalPlayer:GetAttribute("TeleportFlags")) or 0,
+	streak   = 0,
+}
+
+function Fn.deliveryFailed()
+	Delivery.failedAt = os.clock()
+end
+
+do
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	local reusable = remotes and remotes:FindFirstChild("Reusable")
+	local message = reusable and reusable:FindFirstChild("GameMessage")
+	if message and message:IsA("RemoteEvent") then
+		Fn.track(message.OnClientEvent:Connect(function(text)
+			if type(text) == "string" and string.find(text, "Egg Delivery Failed", 1, true) then
+				Fn.deliveryFailed()
+			end
+		end))
+	end
+	Fn.track(LocalPlayer:GetAttributeChangedSignal("TeleportFlags"):Connect(function()
+		local now = tonumber(LocalPlayer:GetAttribute("TeleportFlags")) or 0
+		if now > Delivery.flags then Fn.deliveryFailed() end
+		Delivery.flags = now
+	end))
+end
+
+-- Seconds to carry an egg from `from` to `to` at the carry speed.
+function Fn.homeTime(from, to)
+	return (to - from).Magnitude / CARRY_SPEED * HOME_FACTOR
+end
+
+-- Walks `target` (a spot on the plot) on the ground: every frame the character moves a
+-- little toward it and is put back on whatever surface is underneath, standing height.
+function Fn.groundTrip(target, abort, reach)
+	local root = Fn.root()
+	if not root then return false end
+	reach = reach or 4
+	local char = LocalPlayer.Character
+	local hum = Fn.humanoid and Fn.humanoid()
+	local stand = root.Size.Y / 2 + (hum and hum.HipHeight or 2)
+	if Fn.rideHeight and Fn.ridingPet and Fn.isRiding(Fn.ridingPet) then stand = Fn.rideHeight end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char, ActiveEggs }
+	params.RespectCanCollide = true
+
+	local flatTarget = Vector3.new(target.X, 0, target.Z)
+	local deadline = os.clock() + Fn.homeTime(root.Position, target) + 8
+	Fn.setNoclip(true)
+	local keepOff = RunService.Stepped:Connect(function()
+		local c = LocalPlayer.Character
+		if not c then return end
+		for _, part in ipairs(c:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
+		end
+	end)
+
+	local arrived = false
+	while os.clock() < deadline and Fn.alive() do
+		if abort and abort() then break end
+		local dt = RunService.Heartbeat:Wait()
+		root = Fn.root()
+		if not root then break end
+
+		local flat = Vector3.new(root.Position.X, 0, root.Position.Z)
+		local gap = flatTarget - flat
+		if gap.Magnitude <= reach then arrived = true break end
+
+		local step = math.min(gap.Magnitude, CARRY_SPEED * dt)
+		local nextFlat = flat + gap.Unit * step
+		local x, z = nextFlat.X, nextFlat.Z
+
+		-- Ground under the new spot, searched from a little above where we are now.
+		local hit = Workspace:Raycast(Vector3.new(x, root.Position.Y + 40, z), Vector3.new(0, -400, 0), params)
+		local y = hit and (hit.Position.Y + stand) or root.Position.Y
+
+		pcall(function()
+			root.CFrame = CFrame.lookAt(Vector3.new(x, y, z), Vector3.new(x + gap.X, y, z + gap.Z))
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		end)
+	end
+
+	keepOff:Disconnect()
+	Fn.setNoclip(false)
+	root = Fn.root()
+	if root then pcall(function() root.AssemblyLinearVelocity = Vector3.zero end) end
+	return arrived
+end
+
 -- Takes the basket home and waits for the plot to accept it.
 function Fn.deliver(abort)
 	local count = Fn.basketCount()
@@ -626,16 +873,34 @@ function Fn.deliver(abort)
 	if not top then return false end
 
 	S.status = "Bringing eggs home"
-	Fn.flyTo(top + Vector3.new(0, 4, 0), abort, 4)
+	local started = os.clock()
+	Fn.groundTrip(top, abort, 4)
 
-	local deadline = os.clock() + 3
-	while Fn.basketCount() > 0 and os.clock() < deadline do RunService.Heartbeat:Wait() end
+	-- The basket empties on success and on failure alike (a refused egg is sent back),
+	-- so the verdict is whether the game complained.
+	local deadline = os.clock() + 4
+	while Fn.basketCount() > 0 and os.clock() < deadline and Fn.alive() do RunService.Heartbeat:Wait() end
+	local settle = os.clock() + 1.2
+	while os.clock() < settle and Delivery.failedAt < started and Fn.alive() do RunService.Heartbeat:Wait() end
 
-	if Fn.basketCount() == 0 then
+	if Fn.basketCount() == 0 and Delivery.failedAt < started then
 		Stat.delivered = Stat.delivered + count
+		Delivery.streak = 0
 		PickupPos = nil
 		Fn.reportEggs()
+		-- Off the pet after every delivery; the next trip mounts it again.
+		Fn.dismount()
 		return true
+	end
+
+	Stat.refused = Stat.refused + count
+	Delivery.streak = Delivery.streak + 1
+	S.status = "Delivery refused"
+	if Delivery.streak >= MAX_DELIVERY_FAILS then
+		Delivery.streak = 0
+		S.autoCollect = false
+		if Fn.CollectToggle then pcall(function() Fn.CollectToggle:Set(false) end) end
+		Fn.notify("Auto Collect stopped", "The server refused " .. MAX_DELIVERY_FAILS .. " deliveries in a row.", 8)
 	end
 	return false
 end
@@ -645,6 +910,10 @@ function Fn.collectStep(abort)
 	if not Fn.root() then return false end
 	local capacity, gained = Fn.basketCapacity(), false
 
+	if S.ridePet and Fn.basketCount() == 0 and #Fn.eggCandidates(Fn.root().Position) > 0 then
+		Fn.mountBest(abort)
+	end
+
 	while Fn.basketCount() < capacity and not abort() do
 		local root = Fn.root()
 		if not root then break end
@@ -652,7 +921,7 @@ function Fn.collectStep(abort)
 		-- Head home if the oldest egg in the basket cannot wait for another trip.
 		local deadline, top = Fn.basketDeadline(), Fn.plotTop()
 		if deadline and top then
-			local left = deadline - Workspace:GetServerTimeNow() - Fn.travelTime(root.Position, top)
+			local left = deadline - Workspace:GetServerTimeNow() - Fn.homeTime(root.Position, top)
 			if left < DELIVER_MARGIN then break end
 		end
 
@@ -1135,10 +1404,10 @@ function Fn.cycle()
 	end
 	local function choresOpen() return not stopAll() and os.clock() < budgetEnd end
 
-	if choresOpen() and Fn.plantWanted() and job(Fn.plantStep, stopChore("autoPlant")) then worked = true end
-	if choresOpen() and Fn.hatchWanted() and job(Fn.hatchStep, stopChore("autoHatch")) then worked = true end
-	if choresOpen() and Fn.placeWanted() and job(Fn.placeStep, stopChore("autoPlace")) then worked = true end
-	if choresOpen() and Fn.feedWanted() and job(Fn.feedStep, stopChore("autoFeed")) then worked = true end
+	if choresOpen() and Fn.plantWanted() and Fn.dismount() and job(Fn.plantStep, stopChore("autoPlant")) then worked = true end
+	if choresOpen() and Fn.hatchWanted() and Fn.dismount() and job(Fn.hatchStep, stopChore("autoHatch")) then worked = true end
+	if choresOpen() and Fn.placeWanted() and Fn.dismount() and job(Fn.placeStep, stopChore("autoPlace")) then worked = true end
+	if choresOpen() and Fn.feedWanted() and Fn.dismount() and job(Fn.feedStep, stopChore("autoFeed")) then worked = true end
 
 	if S.autoCollect and not stopAll() then
 		if job(Fn.collectStep, function() return stopAll() or not S.autoCollect end) then worked = true end
@@ -2219,21 +2488,44 @@ end
 
 function Fn.addSlider(tab, label, name, flag, range, increment, suffix, default, onChange)
 	return Fn.safeUI(label, function()
-		return tab:CreateSlider({
+		local element = tab:CreateSlider({
 			Name = name, Range = range, Increment = increment, Suffix = suffix,
 			CurrentValue = default, Flag = flag,
 			Callback = function(v) onChange(v) end,
 		})
+
+		-- Rayfield applies the saved config through element:Set. A value of the wrong
+		-- kind (a flag an older version used for another control) would error there.
+		if type(element) == "table" and type(element.Set) == "function" then
+			local set = element.Set
+			element.Set = function(self, value, ...)
+				value = tonumber(type(value) == "table" and value[1] or value)
+				if not value then return end
+				return set(self, value, ...)
+			end
+		end
+		return element
 	end)
 end
 
 function Fn.addDropdown(tab, label, name, flag, options, default, multi, onChange)
 	return Fn.safeUI(label, function()
-		return tab:CreateDropdown({
+		local element = tab:CreateDropdown({
 			Name = name, Options = options, CurrentOption = default,
 			MultipleOptions = multi, Flag = flag,
 			Callback = function(selected) onChange(selected) end,
 		})
+
+		-- Same guard as the slider: a saved number for a dropdown would make
+		-- Rayfield's Set index it and error. Turn it into the matching option text.
+		if type(element) == "table" and type(element.Set) == "function" then
+			local set = element.Set
+			element.Set = function(self, value, ...)
+				if type(value) ~= "table" and type(value) ~= "string" then value = { tostring(value) } end
+				return set(self, value, ...)
+			end
+		end
+		return element
 	end)
 end
 
@@ -2304,7 +2596,7 @@ end
 local PRIORITIES = { "Highest Luck", "Highest Rarity", "Nearest", "Farthest" }
 
 Fn.addSection(FarmTab, "Auto Collect Eggs")
-Fn.addToggle(FarmTab, "Farm/Collect", "Auto Collect Eggs", "AutoCollect", false, function(v) S.autoCollect = v end)
+Fn.CollectToggle = Fn.addToggle(FarmTab, "Farm/Collect", "Auto Collect Eggs", "AutoCollect", false, function(v) S.autoCollect = v end)
 Fn.addDropdown(FarmTab, "Farm/MinRank", "Min Egg Rarity", "MinEggRarity", RARITY_CHOICES, { "Any" }, false, function(s)
 	S.minEggRank = RARITY_RANK[Fn.firstOption(s)] or 0
 end)
@@ -2314,8 +2606,9 @@ end)
 Fn.addDropdown(FarmTab, "Farm/Priority", "Collect Priority", "CollectPriority", PRIORITIES, { "Highest Rarity" }, false, function(s)
 	S.collectPriority = Fn.firstOption(s)
 end)
+Fn.addToggle(FarmTab, "Farm/Ride", "Ride Best Pet", "RidePet", true, function(v) S.ridePet = v end)
 Fn.addSlider(FarmTab, "Farm/Speed", "Tween Speed", "FlySpeed", { 100, 1300 }, 25, " studs/s", S.flySpeed, function(v)
-	S.flySpeed = math.clamp(tonumber(v) or 600, 100, 1300)
+	S.flySpeed = math.clamp(tonumber(v) or 1300, 100, 1300)
 end)
 
 Fn.addSection(FarmTab, "Auto Plant & Hatch")
