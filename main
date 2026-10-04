@@ -2413,12 +2413,29 @@ end)
 -- UI
 -----------------------------------------------------------
 
-local ok, Rayfield = pcall(function()
-	return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
-end)
+-- sirius.menu is tried first, then the same library from GitHub in case that host is blocked.
+local RAYFIELD_URLS = {
+	"https://sirius.menu/rayfield",
+	"https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua",
+}
 
-if not ok or not Rayfield then
-	warn("[RAP] Rayfield failed to load")
+local Rayfield, rayfieldErrors = nil, {}
+for _, url in ipairs(RAYFIELD_URLS) do
+	local ok, result = pcall(function()
+		local body = game:HttpGet(url)
+		local chunk, compileError = loadstring(body)
+		if not chunk then error("loadstring: " .. tostring(compileError)) end
+		return chunk()
+	end)
+	if ok and result then
+		Rayfield = result
+		break
+	end
+	rayfieldErrors[#rayfieldErrors + 1] = url .. " -> " .. tostring(result)
+end
+
+if not Rayfield then
+	warn("[RAP] Rayfield failed to load: " .. table.concat(rayfieldErrors, " | "))
 	return
 end
 
